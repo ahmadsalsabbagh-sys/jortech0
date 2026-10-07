@@ -1,0 +1,1147 @@
+import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Trans, useTranslation } from 'react-i18next';
+import { nextReconnectState } from '../utils/reconnectState';
+import { applyIncomingToChatList, promoteChatWithSnippet } from '../utils/chatList';
+import { filterChats, filterChannels, groupStatusesByContact } from '../utils/chatFilters';
+import { ArrowLeft, Loader2, Megaphone, CircleDashed, AlertCircle, MessageSquare } from 'lucide-react';
+import { useProfilePicture } from '../hooks/useProfilePicture';
+import { useProfilePictures } from '../hooks/useProfilePictures';
+import { useResolvedPhone } from '../hooks/useResolvedPhone';
+import { formatPhoneForDisplay } from '../utils/formatPhone';
+import {
+  sessionApi,
+  messageApi,
+  asMessageType,
+  type Session,
+  type Chat,
+  type ChatKind,
+  type Channel,
+  type SearchHit,
+  type ContactStatusGroup,
+} from '../services/api';
+import {
+  applyMessageEdit,
+  mergeDeliveryStatus,
+  mergeReactionSnapshot,
+  findRevokedIndex,
+  patchMatchingMessage,
+  byMessageId,
+  getMediaSrc,
+  liveMessageMetadata,
+  stripMentionDelimiters,
+  type ChatMessageView,
+  type MessageMedia,
+} from '../utils/chatMessages';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useToast } from '../hooks/useToast';
+import { useRole } from '../hooks/useRole';
+import { PageHeader } from '../components/PageHeader';
+import { GlobalSearch } from '../components/GlobalSearch';
+import {
+  useChatMessages,
+  useChatMessagesActions,
+  messagesQueryKey,
+  updateCachedMessages,
+  cachedSessionThreads,
+} from '../hooks/useChatMessages';
+import { useChannelMessages } from '../hooks/useChannelMessages';
+import { useContactStatuses } from '../hooks/useContactStatuses';
+import { useChatScrollPosition } from '../hooks/useChatScrollPosition';
+import { createTrailingCoalescer } from '../utils/trailingCoalescer';
+import MessageBody from '../components/chats/MessageBody';
+import MediaLightbox, { type LightboxItem } from '../components/chats/MediaLightbox';
+import KindIcon from '../components/chats/KindIcon';
+import ChatSidebar from '../components/chats/ChatSidebar';
+import ChatThread from '../components/chats/ChatThread';
+import ChatComposer, { type StagedAttachment } from '../components/chats/ChatComposer';
+import StatusMedia from '../components/chats/StatusMedia';
+import StatusComposeModal from '../components/chats/StatusComposeModal';
+import './Chats.css';
+
+// Quiet window for coalescing mark-as-read RPCs (see markReadCoalescer below).
+const MARK_READ_DEBOUNCE_MS = 750;
+
+// mergeDeliveryStatus (forward-only delivery-tick merge) is shared with mergeOrAppend in utils/chatMessages
+// so the WS append path and the ack path apply the exact same rule.
+
+interface IncomingWsMessage {
+  id: string;
+  chatId: string;
+  from: string;
+  to: string;
+  body: string;
+  type: string;
+  timestamp: number;
+  fromMe?: boolean;
+  media?: MessageMedia;
+  quotedMessage?: { id: string; body: string };
+  // The backend emits `call` as a top-level field on the live `message.received` event (it's only
+  // folded into `metadata` on the persisted/history path), so declare it here to carry it through.
+  call?: { video: boolean; missed: boolean };
+  /** Business prompt choices (Baileys); top-level on the live event, folded into metadata for the UI. */
+  buttons?: Array<{ id: string; text: string }>;
+  metadata?: ChatMessageView['metadata'];
+  kind?: ChatKind;
+  /** Group poster: `from` is the group JID, so `contact`/`author` identify who actually sent it. */
+  contact?: { id?: string; name?: string; pushName?: string };
+  author?: string;
+}
+
+// WhatsApp's text-status font slots — the current wire enum is {0,1,2,6,7,8,9,10} (6 is the bold
+// system face); 3–5 are legacy slots older clients still emit. Approximated with generic
+// families/weights since the actual faces are proprietary; slot 0 and unknown slots keep the UI
+// default.
+const STATUS_FONT: Record<number, { family?: string; weight?: number }> = {
+  1: { family: 'serif' },
+  2: { family: 'cursive' },
+  3: { family: 'fantasy' }, // legacy
+  4: { family: 'serif' }, // legacy
+  5: { family: 'ui-rounded, system-ui, sans-serif' }, // legacy
+  6: { weight: 700 },
+  7: { family: 'cursive' },
+  8: { family: 'serif' },
+  9: { family: 'sans-serif', weight: 800 },
+  10: { family: 'monospace', weight: 700 },
+};
+
+/** Inline style for a status item's font slot; {} when unstyled/unknown. */
+const statusFontStyle = (font?: number): { fontFamily?: string; fontWeight?: number } => {
+  if (font === undefined) return {};
+  const slot = STATUS_FONT[font];
+  if (!slot) return {};
+  return {
+    ...(slot.family ? { fontFamily: slot.family } : {}),
+    ...(slot.weight ? { fontWeight: slot.weight } : {}),
+  };
+};
+
+/** Helper to extract accurate timestamp for sorting chats newest first */
+const getChatTimestamp = (c: Chat): number => {
+  const raw = c as unknown as Record<string, unknown>;
+  const rawTime = c.timestamp || raw.conversationTimestamp || raw.lastMessageTimestamp || raw.t || 0;
+  return Number(rawTime);
+};
+
+export function Chats() {
+  const { t } = useTranslation();
+  useDocumentTitle(t('nav.chats'));
+  const { error: showErrorToast, warning: showWarningToast } = useToast();
+  const { canWrite, engineType } = useRole();
+
+  // Sessions list & active session
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string>('');
+  const [loadingSessions, setLoadingSessions] = useState<boolean>(true);
+
+  // Chats list
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [loadingChats, setLoadingChats] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+
+  // Selected chat & message history
+  const [activeChat, setActiveChat] = useState<Chat | null>(null);
+  const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
+  // Only the contact id is state — the open group is derived from groupedStatuses at render, so a
+  // refetch (window focus, post-compose) flows straight into the open viewer instead of leaving it
+  // pinned to the snapshot captured at click time. A group that disappears (all items expired)
+  // simply closes the viewer.
+  const [activeStatusContactId, setActiveStatusContactId] = useState<string | null>(null);
+
+  // Chats/Channels/Status tab selection. Switching tabs closes whatever conversation is open so a
+  // press on another tab doesn't leave a Chats-tab room rendered underneath a Channels/Status list.
+  const [activeTab, setActiveTab] = useState<'chats' | 'channels' | 'status'>('chats');
+  const switchTab = useCallback((tab: 'chats' | 'channels' | 'status') => {
+    setActiveTab(tab);
+    setActiveChat(null);
+    setActiveChannel(null);
+    setActiveStatusContactId(null);
+  }, []);
+
+  // Channels tab: only whatsapp-web.js implements channel listing/reading — Baileys throws 501 for
+  // both, so the query is gated off entirely (never fired) rather than left to fail per-request.
+  // The engine comes from the sign-in validate response, which every role can read.
+  const channelsSupported = engineType === 'whatsapp-web.js';
+  const channelsQuery = useQuery({
+    queryKey: ['channels', selectedSessionId],
+    queryFn: () => sessionApi.getSubscribedChannels(selectedSessionId!),
+    enabled: Boolean(selectedSessionId) && channelsSupported && activeTab === 'channels',
+  });
+  const channelMessages = useChannelMessages(selectedSessionId, activeChannel?.id ?? null);
+
+  // Status tab: both engines expose stored status content, so this query isn't engine-gated (unlike
+  // channelsQuery above) — but it is tab-gated the same way, so selecting a session on another tab
+  // doesn't fire a background /status fetch nobody is looking at.
+  const statusesQuery = useContactStatuses(selectedSessionId, activeTab === 'status');
+
+  // A channel feed opens at its newest post, mirroring the chat room's initial scroll. The pane is
+  // also keyed by channel id, so switching channels remounts the feed instead of reusing the DOM
+  // (and its stale scroll offset) of the previous channel.
+  const channelFeedRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = channelFeedRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeChannel?.id, channelMessages.data]);
+
+  // --- Status compose modal ---
+  // The page owns only the open flag (its trigger sits in the sidebar header below); the form
+  // itself — state, contacts query, submit — is components/chats/StatusComposeModal.
+  const [composeOpen, setComposeOpen] = useState<boolean>(false);
+
+  const {
+    data: messages = [],
+    isLoading: loadingMessages,
+    isError: messagesError,
+    hasNextPage: hasMoreMessages,
+    isFetchingNextPage: loadingOlderMessages,
+    fetchNextPage,
+  } = useChatMessages(selectedSessionId, activeChat?.id ?? null);
+  const { appendMessage, updateMessage } = useChatMessagesActions();
+  const queryClient = useQueryClient();
+
+  // Lightbox state for media viewer
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+
+  const [replyingTo, setReplyingTo] = useState<ChatMessageView | null>(null);
+  // Draft text lives here (not in ChatComposer) so it survives closing/switching the room.
+  const [messageInput, setMessageInput] = useState<string>('');
+  // The staged attachment lives here for the same reason the draft text does — ChatComposer
+  // unmounts when the room closes, which would silently discard a picked file. Unlike the text
+  // draft it is dropped when a DIFFERENT chat is opened (see the effect below): a file that
+  // follows the user into another conversation can be sent to the wrong recipient.
+  const [attachment, setAttachment] = useState<StagedAttachment | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  // Revoke the object URL created for an image-attachment preview once it is replaced or cleared.
+  // The cleanup runs with the previous value on every change, so this single effect covers all
+  // paths (new file, remove, send, chat switch) — otherwise each preview leaks a blob held for the
+  // lifetime of the document. It lives here, not in ChatComposer: revoking on the composer's
+  // unmount would hand a reopened room a dead blob URL for an attachment that is still staged.
+  useEffect(() => {
+    if (!previewUrl) return;
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
+
+  // Drop a staged attachment and a staged reply when the user moves to a DIFFERENT chat. Closing the
+  // room (`activeChat` → null) deliberately keeps them, so close/reopen is a lossless round trip; only
+  // an actual change of conversation clears. A reply carried across would quote the previous chat's
+  // message, text and sender included, into the new one. The composer invalidates its in-flight
+  // FileReader on the same transition, so a late read cannot re-stage the file against the new chat.
+  const lastRoomIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const current = activeChat?.id ?? null;
+    if (current === null) return;
+    const previous = lastRoomIdRef.current;
+    lastRoomIdRef.current = current;
+    if (previous === null || previous === current) return;
+    setAttachment(null);
+    setPreviewUrl(null);
+    setReplyingTo(null);
+  }, [activeChat]);
+
+  // Per-chat scroll-position memory + auto-scroll heuristic.
+  // Pass `messages.length > 0` as the loaded signal: it stays stable once the
+  // chat has any message (doesn't toggle per append) and covers both the
+  // first-fetch resolution and a WS-driven first message on a previously-empty
+  // chat. `loadingMessages` alone would miss the latter case.
+  const {
+    containerRef: messagesContainerRef,
+    onMessageAppended,
+    onMediaLoad,
+    measureMedia,
+    onOlderMessagesRequested,
+  } = useChatScrollPosition(activeChat?.id ?? null, messages.length > 0, loadingOlderMessages);
+
+  const handleLoadOlderMessages = useCallback(() => {
+    onOlderMessagesRequested();
+    void fetchNextPage();
+  }, [fetchNextPage, onOlderMessagesRequested]);
+
+  // Batch profile-picture fetch for the visible chat list — ONE request for the whole sidebar
+  // (per-row queries burst the per-IP throttle into 429s). Sorted-key cached 1h; rows fall back
+  // to the generic icon for ids that resolve null.
+  const chatIds = useMemo(() => chats.map(c => c.id), [chats]);
+  const listPics = useProfilePictures(selectedSessionId || undefined, chatIds);
+
+  // Profile-picture fetch for the active room (cached 1h by useProfilePicture; TanStack Query
+  // dedupes, so other components querying the same key share this slice).
+  const activePp = useProfilePicture(selectedSessionId || undefined, activeChat?.id);
+
+  // Header phone line. Local formatting handles @c.us ids offline; for anything else personal
+  // (notably @lid privacy ids, which are NOT phones and must never be formatted as one) resolve
+  // the real number through the engine — cached a day, and only fired when local formatting failed.
+  const activePhoneDisplay = activeChat ? formatPhoneForDisplay(activeChat.id) : null;
+  const needsPhoneResolution = Boolean(activeChat && activeChat.kind === 'individual' && !activePhoneDisplay);
+  const resolvedPhoneQ = useResolvedPhone(
+    needsPhoneResolution ? selectedSessionId || undefined : undefined,
+    needsPhoneResolution ? activeChat?.id : undefined,
+  );
+  const activePhoneText =
+    activePhoneDisplay ?? (resolvedPhoneQ.data ? formatPhoneForDisplay(resolvedPhoneQ.data) : null);
+
+  // The list loaders below reach the translator and the error toast through a ref, not as
+  // dependencies: both change identity on a language switch, which re-ran the session load (it
+  // reselected the first session) and, through loadChats, the session-reset effect (it closed the
+  // open chat and dropped a staged file or reply).
+  const loadErrorRef = useRef({ t, showErrorToast });
+  useEffect(() => {
+    loadErrorRef.current = { t, showErrorToast };
+  });
+  const showLoadError = useCallback((key: string, err: unknown) => {
+    const current = loadErrorRef.current;
+    current.showErrorToast(current.t(key), err instanceof Error ? err.message : undefined);
+  }, []);
+
+  // 1. Fetch available connected sessions on mount
+  useEffect(() => {
+    const loadSessions = async () => {
+      try {
+        setLoadingSessions(true);
+        const list = await sessionApi.list();
+        const readySessions = list.filter(s => s.status === 'ready');
+        setSessions(readySessions);
+        if (readySessions.length > 0) {
+          setSelectedSessionId(readySessions[0].id);
+        }
+      } catch (err) {
+        showLoadError('chats.errors.loadSessions', err);
+      } finally {
+        setLoadingSessions(false);
+      }
+    };
+    void loadSessions();
+  }, [showLoadError]);
+
+  // 2. Fetch chats when active session changes. Guaranteed to sort newest first.
+  const chatsRequestRef = useRef(0);
+  const chatsAppliedRef = useRef(0);
+  const chatsSessionRef = useRef('');
+  // The session whose list `chats` holds, which a switch leaves on screen until the new list lands.
+  const listedSessionRef = useRef('');
+  // The newest request number out when a live frame last moved each chat's row.
+  const liveRowsRef = useRef(new Map<string, number>());
+  const loadChats = useCallback(
+    async (sessionId: string, { background = false } = {}): Promise<boolean> => {
+      if (!sessionId) return false;
+      const request = ++chatsRequestRef.current;
+      chatsSessionRef.current = sessionId;
+      const stale = () => sessionId !== chatsSessionRef.current || request < chatsAppliedRef.current;
+      const overtaken = () => sessionId === chatsSessionRef.current;
+      try {
+        if (!background) setLoadingChats(true);
+        const data = await sessionApi.getChats(sessionId);
+        if (stale()) return overtaken();
+        chatsAppliedRef.current = request;
+        const moved = (id: string) => (liveRowsRef.current.get(id) ?? 0) >= request;
+        const merge = background && listedSessionRef.current === sessionId;
+        listedSessionRef.current = sessionId;
+        setChats(prev => {
+          const live = new Map(merge ? prev.map(c => [c.id, c] as const) : []);
+          return data
+            .map(c => {
+              const row = live.get(c.id);
+              const cTime = getChatTimestamp(c);
+              const rowTime = row ? getChatTimestamp(row) : 0;
+              return row && moved(c.id) && rowTime > cTime ? row : c;
+            })
+            .sort((a, b) => getChatTimestamp(b) - getChatTimestamp(a));
+        });
+        return true;
+      } catch (err) {
+        if (stale()) return overtaken();
+        if (background) return false;
+        showLoadError('chats.errors.loadChats', err);
+        listedSessionRef.current = sessionId;
+        setChats([]);
+        return false;
+      } finally {
+        if (!background && sessionId === chatsSessionRef.current) setLoadingChats(false);
+      }
+    },
+    [showLoadError],
+  );
+
+  // A send resolves after the await, promoting chat to the top.
+  const promoteSentChat = useCallback((sessionId: string, chatId: string, snippet: string, sentAt: number) => {
+    if (sessionId !== chatsSessionRef.current) return;
+    setChats(prev => {
+      const updated = promoteChatWithSnippet(prev, chatId, snippet, sentAt);
+      return [...updated].sort((a, b) => getChatTimestamp(b) - getChatTimestamp(a));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (selectedSessionId) {
+      void loadChats(selectedSessionId);
+      setActiveChat(null);
+      setActiveChannel(null);
+      setActiveStatusContactId(null);
+      setAttachment(null);
+      setPreviewUrl(null);
+      setReplyingTo(null);
+      lastRoomIdRef.current = null;
+    }
+  }, [selectedSessionId, loadChats]);
+
+  // Coalesce mark-as-read RPCs per chat
+  const markReadCoalescer = useMemo(
+    () =>
+      createTrailingCoalescer<string>(chatId => {
+        void sessionApi.markChatRead(selectedSessionId, chatId).catch(err => {
+          showWarningToast(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
+        });
+      }, MARK_READ_DEBOUNCE_MS),
+    [selectedSessionId, t, showWarningToast],
+  );
+
+  useEffect(() => () => markReadCoalescer.flush(), [markReadCoalescer]);
+
+  const markChatRead = useCallback(
+    (chatId: string) => {
+      if (canWrite) markReadCoalescer.call(chatId);
+    },
+    [markReadCoalescer, canWrite],
+  );
+
+  // 3. WebSocket integration for real-time messages with group sender name recovery
+  const chatsRef = useRef(chats);
+  const activeChatIdRef = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    chatsRef.current = chats;
+    activeChatIdRef.current = activeChat?.id;
+  });
+  useEffect(
+    () => () => {
+      activeChatIdRef.current = undefined;
+    },
+    [],
+  );
+
+  const handleIncomingMessage = useCallback(
+    (event: { sessionId: string; message: Record<string, unknown> }) => {
+      if (event.sessionId !== selectedSessionId) return;
+
+      const newMsg = event.message as unknown as IncomingWsMessage;
+
+      // Extract sender display name or formatted phone number for group chats
+      const groupSenderDisplayName =
+        newMsg.contact?.pushName ??
+        newMsg.contact?.name ??
+        (newMsg.author ? formatPhoneForDisplay(newMsg.author) || newMsg.author.split('@')[0] : undefined);
+
+      const mappedMessage: ChatMessageView = {
+        id: newMsg.id,
+        waMessageId: newMsg.id,
+        chatId: newMsg.chatId,
+        chatName: groupSenderDisplayName,
+        author: newMsg.author,
+        from: newMsg.from,
+        to: newMsg.to,
+        body: newMsg.body,
+        type: asMessageType(newMsg.type),
+        direction: newMsg.fromMe ? 'outgoing' : 'incoming',
+        status: 'sent',
+        timestamp: newMsg.timestamp,
+        createdAt: new Date(newMsg.timestamp * 1000).toISOString(),
+        metadata: liveMessageMetadata(newMsg),
+        kind: newMsg.kind,
+      };
+
+      appendMessage(event.sessionId, newMsg.chatId, mappedMessage);
+
+      if (activeChat && newMsg.chatId === activeChat.id) {
+        markChatRead(activeChat.id);
+        if (!newMsg.fromMe) onMessageAppended('incoming');
+      }
+
+      const listOptions = {
+        activeChatId: canWrite ? activeChat?.id : undefined,
+        locationLabel: `📍 ${t('chats.media.location')}`,
+      };
+      liveRowsRef.current.set(newMsg.chatId, chatsRequestRef.current);
+      const { needsSidebarRefetch } = applyIncomingToChatList(chatsRef.current, newMsg, listOptions);
+      setChats(prevChats => {
+        const nextList = applyIncomingToChatList(prevChats, newMsg, listOptions).chats;
+        return [...nextList].sort((a, b) => getChatTimestamp(b) - getChatTimestamp(a));
+      });
+      if (needsSidebarRefetch) {
+        void loadChats(selectedSessionId, { background: true });
+      }
+    },
+    [selectedSessionId, activeChat, canWrite, loadChats, markChatRead, appendMessage, onMessageAppended, t],
+  );
+
+  const handleIncomingMessageAck = useCallback(
+    (event: { sessionId: string; messageId: string; status: ChatMessageView['status'] }) => {
+      if (event.sessionId !== selectedSessionId) return;
+
+      for (const [key, thread] of cachedSessionThreads(queryClient, event.sessionId, byMessageId(event.messageId))) {
+        const target = thread.find(byMessageId(event.messageId));
+        if (!target) continue;
+        const nextStatus = mergeDeliveryStatus(target.status, event.status) ?? target.status;
+        if (nextStatus === target.status) continue;
+        updateCachedMessages(queryClient, key, list =>
+          patchMatchingMessage(list, event.messageId, m => ({ ...m, status: nextStatus })),
+        );
+      }
+    },
+    [selectedSessionId, queryClient],
+  );
+
+  const handleIncomingMessageReaction = useCallback(
+    (event: { sessionId: string; messageId: string; reactions?: Record<string, string> }) => {
+      if (event.sessionId !== selectedSessionId) return;
+
+      for (const [key] of cachedSessionThreads(queryClient, event.sessionId, byMessageId(event.messageId))) {
+        updateCachedMessages(queryClient, key, list =>
+          patchMatchingMessage(list, event.messageId, m => ({
+            ...m,
+            metadata: {
+              ...(m.metadata || {}),
+              reactions: mergeReactionSnapshot(m.metadata?.reactions, event.reactions),
+            },
+          })),
+        );
+      }
+    },
+    [selectedSessionId, queryClient],
+  );
+
+  const handleIncomingMessageRevoked = useCallback(
+    (event: { sessionId: string; id: string; revokedId?: string; chatId: string; type: string }) => {
+      if (event.sessionId !== selectedSessionId) return;
+
+      const revoked = (m: ChatMessageView): boolean => findRevokedIndex([m], event) !== -1;
+      let matchedCachedMessage = false;
+      let revokedLastMessage = false;
+      for (const [key, thread] of cachedSessionThreads(queryClient, event.sessionId, revoked)) {
+        matchedCachedMessage = true;
+        if (key[2] === event.chatId && findRevokedIndex(thread, event) === thread.length - 1) {
+          revokedLastMessage = true;
+        }
+        updateCachedMessages(queryClient, key, list => {
+          const idx = findRevokedIndex(list, event);
+          if (idx === -1) return list;
+          const next = list.slice();
+          next[idx] = { ...next[idx], body: '', type: asMessageType(event.type) };
+          return next;
+        });
+      }
+      if (revokedLastMessage) {
+        setChats(previous => previous.map(chat => (chat.id === event.chatId ? { ...chat, lastMessage: '' } : chat)));
+      } else if (!matchedCachedMessage) {
+        void loadChats(selectedSessionId, { background: true });
+      }
+    },
+    [selectedSessionId, queryClient, loadChats],
+  );
+
+  const handleIncomingMessageEdited = useCallback(
+    (event: { sessionId: string; messageId: string; chatId: string; body: string }) => {
+      if (event.sessionId !== selectedSessionId) return;
+
+      let matchedCachedMessage = false;
+      let editedLastMessage = false;
+      for (const [key, thread] of cachedSessionThreads(queryClient, event.sessionId, byMessageId(event.messageId))) {
+        const editedIndex = thread.findIndex(byMessageId(event.messageId));
+        if (editedIndex === -1) continue;
+        matchedCachedMessage = true;
+        updateCachedMessages(queryClient, key, list => applyMessageEdit(list, event));
+
+        if (key[2] === event.chatId && editedIndex === thread.length - 1) editedLastMessage = true;
+      }
+      if (editedLastMessage) {
+        setChats(previous =>
+          previous.map(chat => (chat.id === event.chatId ? { ...chat, lastMessage: event.body } : chat)),
+        );
+      } else if (!matchedCachedMessage) {
+        void loadChats(selectedSessionId, { background: true });
+      }
+    },
+    [selectedSessionId, queryClient, loadChats],
+  );
+
+  const handleStatusReceived = useCallback(
+    (event: { sessionId: string }) => {
+      queryClient.invalidateQueries({ queryKey: ['contact-statuses', event.sessionId] });
+    },
+    [queryClient],
+  );
+
+  const wsEvents = useMemo(
+    () => ({
+      onMessage: handleIncomingMessage,
+      onMessageAck: handleIncomingMessageAck,
+      onMessageReaction: handleIncomingMessageReaction,
+      onMessageRevoked: handleIncomingMessageRevoked,
+      onMessageEdited: handleIncomingMessageEdited,
+      onStatusReceived: handleStatusReceived,
+    }),
+    [
+      handleIncomingMessage,
+      handleIncomingMessageAck,
+      handleIncomingMessageReaction,
+      handleIncomingMessageRevoked,
+      handleIncomingMessageEdited,
+      handleStatusReceived,
+    ],
+  );
+  const { isConnected, connectionFailed, reconnect, subscribe, unsubscribe } = useWebSocket(wsEvents);
+
+  const reconnectHadConnected = useRef(false);
+  const reconnectWasDisconnected = useRef(false);
+  const activeChatId = activeChat?.id;
+  useEffect(() => {
+    const decision = nextReconnectState({
+      isConnected,
+      hadConnected: reconnectHadConnected.current,
+      wasDisconnected: reconnectWasDisconnected.current,
+      connectionFailed,
+    });
+    reconnectHadConnected.current = decision.hadConnected;
+    reconnectWasDisconnected.current = decision.wasDisconnected;
+    if (decision.invalidate) {
+      queryClient.invalidateQueries({ queryKey: ['contact-statuses', selectedSessionId] });
+      const readChatId = canWrite ? activeChatId : undefined;
+      void loadChats(selectedSessionId, { background: true }).then(applied => {
+        if (!applied || !readChatId || activeChatIdRef.current !== readChatId) return;
+        markChatRead(readChatId);
+        setChats(prev => prev.map(c => (c.id === readChatId ? { ...c, unreadCount: 0 } : c)));
+      });
+    }
+  }, [isConnected, connectionFailed, selectedSessionId, queryClient, loadChats, activeChatId, canWrite, markChatRead]);
+
+  useEffect(() => {
+    if (selectedSessionId) void queryClient.invalidateQueries({ queryKey: ['messages', selectedSessionId] });
+  }, [selectedSessionId, queryClient]);
+
+  useEffect(() => {
+    if (selectedSessionId && isConnected) {
+      subscribe(selectedSessionId, [
+        'message.received',
+        'message.sent',
+        'message.ack',
+        'message.reaction',
+        'message.revoked',
+        'message.edited',
+        'status.received',
+      ]);
+      void queryClient.invalidateQueries({ queryKey: ['messages', selectedSessionId] });
+      return () => {
+        unsubscribe(selectedSessionId);
+      };
+    }
+  }, [selectedSessionId, isConnected, subscribe, unsubscribe, queryClient]);
+
+  const handleReactMessage = async (msg: ChatMessageView, emoji: string) => {
+    if (!selectedSessionId || !activeChat) return;
+
+    const msgId = msg.waMessageId || msg.id;
+    const currentReactions = msg.metadata?.reactions || {};
+    const sessionPhone = sessions.find(s => s.id === selectedSessionId)?.phone || 'me';
+
+    let alreadyReacted = false;
+    for (const [sender, emo] of Object.entries(currentReactions)) {
+      if ((sender === 'me' || sender.includes(sessionPhone)) && emo === emoji) {
+        alreadyReacted = true;
+        break;
+      }
+    }
+
+    const emojiToSend = alreadyReacted ? '' : emoji;
+
+    try {
+      await messageApi.react(selectedSessionId, {
+        chatId: activeChat.id,
+        messageId: msgId,
+        emoji: emojiToSend,
+      });
+
+      const key = messagesQueryKey(selectedSessionId, activeChat.id);
+      updateCachedMessages(queryClient, key, old =>
+        old.map(m => {
+          if (m.id === msg.id || m.waMessageId === msg.id) {
+            const metadata = m.metadata || {};
+            const reactions = { ...(metadata.reactions || {}) };
+            if (emojiToSend === '') {
+              delete reactions['me'];
+            } else {
+              reactions['me'] = emojiToSend;
+            }
+            return { ...m, metadata: { ...metadata, reactions } };
+          }
+          return m;
+        }),
+      );
+    } catch (err) {
+      showErrorToast(t('chats.errors.react'), err instanceof Error ? err.message : undefined);
+    }
+  };
+
+  const handleDeleteMessage = async (msg: ChatMessageView) => {
+    if (!selectedSessionId || !activeChat) return;
+    const msgId = msg.waMessageId || msg.id;
+
+    if (!window.confirm(t('chats.deleteConfirm'))) return;
+
+    try {
+      await messageApi.delete(selectedSessionId, {
+        chatId: activeChat.id,
+        messageId: msgId,
+        forEveryone: true,
+      });
+
+      updateMessage(selectedSessionId, activeChat.id, msg.id, { body: '', type: 'revoked' });
+    } catch (err) {
+      showErrorToast(t('chats.errors.delete'), err instanceof Error ? err.message : undefined);
+    }
+  };
+
+  const handleClickButton = async (msg: ChatMessageView, button: { id: string; text: string }) => {
+    if (!selectedSessionId || !activeChat) return;
+    const msgId = msg.waMessageId || msg.id;
+    try {
+      await messageApi.clickButton(selectedSessionId, {
+        chatId: activeChat.id,
+        messageId: msgId,
+        buttonId: button.id,
+        text: button.text,
+      });
+    } catch (err) {
+      showErrorToast(t('chats.errors.clickButton'), err instanceof Error ? err.message : undefined);
+      throw err;
+    }
+  };
+
+  useEffect(() => {
+    if (!activeChat) return;
+    markChatRead(activeChat.id);
+    if (canWrite) setChats(prev => prev.map(c => (c.id === activeChat.id ? { ...c, unreadCount: 0 } : c)));
+  }, [activeChat?.id, markChatRead, canWrite]);
+
+  const pendingHitRef = useRef<{ sessionId: string; chatId: string; waMessageId: string; opened?: boolean } | null>(
+    null,
+  );
+  const [hitSeq, setHitSeq] = useState(0);
+
+  const handleSearchHit = useCallback(
+    async (hit: SearchHit) => {
+      if (hit.sessionId !== selectedSessionId && !sessions.some(s => s.id === hit.sessionId)) {
+        let ready: Session[];
+        try {
+          ready = (await sessionApi.list()).filter(s => s.status === 'ready');
+        } catch (err) {
+          showLoadError('chats.errors.loadSessions', err);
+          return;
+        }
+        if (!ready.some(s => s.id === hit.sessionId)) {
+          pendingHitRef.current = null;
+          showWarningToast(t('chats.errors.searchHitSessionNotReady'));
+          return;
+        }
+        setSessions(ready);
+      }
+      const pending = { sessionId: hit.sessionId, chatId: hit.chatId, waMessageId: hit.waMessageId };
+      pendingHitRef.current = pending;
+      setHitSeq(n => n + 1);
+      if (hit.sessionId !== selectedSessionId) {
+        setSelectedSessionId(hit.sessionId);
+      } else {
+        const chat = chats.find(c => c.id === hit.chatId);
+        if (chat) {
+          if (chat.kind === 'channel') {
+            switchTab('channels');
+            pendingHitRef.current = null;
+          } else {
+            setActiveTab(chat.kind === 'status' ? 'status' : 'chats');
+            setActiveChat(chat);
+            setActiveChannel(null);
+            setActiveStatusContactId(null);
+            pendingHitRef.current = { ...pending, opened: true };
+          }
+        } else {
+          pendingHitRef.current = null;
+        }
+      }
+    },
+    [selectedSessionId, sessions, chats, switchTab, showLoadError, showWarningToast, t],
+  );
+
+  useEffect(() => {
+    const pending = pendingHitRef.current;
+    if (!pending) return;
+    if (pending.sessionId !== selectedSessionId || (pending.opened && activeChat?.id !== pending.chatId)) {
+      pendingHitRef.current = null;
+      return;
+    }
+    if (loadingChats || listedSessionRef.current !== pending.sessionId || activeChat?.id === pending.chatId) return;
+    const chat = chats.find(c => c.id === pending.chatId);
+    if (!chat) {
+      pendingHitRef.current = null;
+    } else if (chat.kind === 'channel') {
+      switchTab('channels');
+      pendingHitRef.current = null;
+    } else {
+      setActiveTab(chat.kind === 'status' ? 'status' : 'chats');
+      setActiveChat(chat);
+      setActiveChannel(null);
+      setActiveStatusContactId(null);
+      pendingHitRef.current = { ...pending, opened: true };
+    }
+  }, [chats, loadingChats, activeChat, selectedSessionId, switchTab]);
+
+  useLayoutEffect(() => {
+    const pending = pendingHitRef.current;
+    if (!pending || listedSessionRef.current !== pending.sessionId || activeChat?.id !== pending.chatId) return;
+    if (loadingMessages || messages.length === 0) return;
+    const container = messagesContainerRef.current;
+    if (container) {
+      try {
+        const el = container.querySelector(`[data-wa-message-id="${pending.waMessageId}"]`);
+        if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center' });
+      } catch {
+        // Selector invalid fallback
+      }
+    }
+    pendingHitRef.current = null;
+  }, [activeChat, loadingMessages, messages, messagesContainerRef, hitSeq]);
+
+  const formatChatTime = useCallback(
+    (timestamp?: number) => {
+      if (!timestamp) return '';
+      const date = new Date(timestamp * 1000);
+      const today = new Date();
+      if (date.toDateString() === today.toDateString()) {
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      }
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      if (date.toDateString() === yesterday.toDateString()) {
+        return t('chats.yesterday');
+      }
+      return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    },
+    [t],
+  );
+
+  // Guarantee filteredChats are always sorted by most recent timestamp first (native WhatsApp style)
+  const filteredChats = useMemo(() => {
+    const list = filterChats(chats, searchQuery);
+    return [...list].sort((a, b) => getChatTimestamp(b) - getChatTimestamp(a));
+  }, [chats, searchQuery]);
+
+  const filteredChannels = filterChannels(channelsQuery.data ?? [], searchQuery);
+  const groupedStatuses: ContactStatusGroup[] = groupStatusesByContact(statusesQuery.data ?? [], searchQuery);
+
+  const activeStatusGroup = activeStatusContactId
+    ? (groupedStatuses.find(g => g.contact.id === activeStatusContactId) ?? null)
+    : null;
+
+  const activeStatusTitle = activeStatusGroup
+    ? (activeStatusGroup.contact.name ?? activeStatusGroup.contact.pushName ?? activeStatusGroup.contact.id)
+    : '';
+
+  const statusFeedRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = statusFeedRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeStatusGroup?.contact.id, activeStatusGroup?.items]);
+
+  useEffect(() => {
+    const closeOpenViewOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+      if (document.querySelector('[role="dialog"], [role="menu"]')) return;
+      if (activeStatusContactId !== null) setActiveStatusContactId(null);
+      else if (activeChannel) setActiveChannel(null);
+      else if (activeChat) setActiveChat(null);
+      else return;
+      event.preventDefault();
+    };
+    document.addEventListener('keydown', closeOpenViewOnEscape);
+    return () => document.removeEventListener('keydown', closeOpenViewOnEscape);
+  }, [activeStatusContactId, activeChannel, activeChat]);
+
+  const imageMedia = useMemo<LightboxItem[]>(
+    () =>
+      messages
+        .filter(m => m.type === 'image' && Boolean(getMediaSrc(m.metadata?.media)))
+        .map(m => ({
+          id: m.id,
+          url: getMediaSrc(m.metadata?.media),
+          alt: m.body || m.metadata?.media?.filename || '',
+          filename: m.metadata?.media?.filename,
+          senderName: undefined,
+          timestamp: formatChatTime(m.timestamp || Math.floor(new Date(m.createdAt).getTime() / 1000)),
+        })),
+    [messages, formatChatTime],
+  );
+
+  return (
+    <div className="chats-page">
+      <PageHeader
+        title={t('nav.chats')}
+        subtitle={t('chats.subtitle')}
+        actions={
+          sessions.length > 0 &&
+          canWrite && <GlobalSearch currentSessionId={selectedSessionId} onHit={handleSearchHit} />
+        }
+      />
+
+      {connectionFailed && (
+        <div className="chats-reconnect-banner" role="alert">
+          <AlertCircle size={16} />
+          <span>{t('common.disconnected')}</span>
+          <button className="btn-secondary" onClick={reconnect}>
+            {t('common.refresh')}
+          </button>
+        </div>
+      )}
+
+      {loadingSessions ? (
+        <div className="chats-loading-container">
+          <Loader2 className="animate-spin" size={32} />
+          <p>{t('common.loading')}</p>
+        </div>
+      ) : sessions.length === 0 ? (
+        <div className="chats-error-state">
+          <AlertCircle size={48} className="text-warn" />
+          <h3>{t('chats.noSessionsTitle')}</h3>
+          <p>
+            <Trans i18nKey="chats.noSessionsDesc">
+              Please connect a WhatsApp session from the <strong>Sessions</strong> menu first to use the chat feature.
+            </Trans>
+          </p>
+        </div>
+      ) : (
+        <div className={`chats-layout ${activeChat || activeChannel || activeStatusGroup ? 'has-active-chat' : ''}`}>
+          {/* LEFT SIDEBAR: session & chat rooms */}
+          <ChatSidebar
+            sessions={sessions}
+            selectedSessionId={selectedSessionId}
+            onSelectSession={setSelectedSessionId}
+            activeTab={activeTab}
+            onSwitchTab={switchTab}
+            searchQuery={searchQuery}
+            onSearchQueryChange={setSearchQuery}
+            onComposeStatus={() => setComposeOpen(true)}
+            formatChatTime={formatChatTime}
+            chatsTab={{
+              loading: loadingChats,
+              chats: filteredChats,
+              activeChatId: activeChat?.id,
+              pictures: listPics.data,
+              onSelectChat: setActiveChat,
+            }}
+            channelsTab={{
+              engineLoading: engineType === null,
+              supported: channelsSupported,
+              query: channelsQuery,
+              channels: filteredChannels,
+              activeChannelId: activeChannel?.id,
+              onSelectChannel: setActiveChannel,
+            }}
+            statusTab={{
+              loading: statusesQuery.isLoading,
+              error: statusesQuery.isError,
+              groups: groupedStatuses,
+              activeContactId: activeStatusContactId,
+              onSelectContact: setActiveStatusContactId,
+            }}
+          />
+
+          {/* RIGHT VIEW: active chat room */}
+          <main className="chats-room">
+            {activeChat ? (
+              <div className="room-container">
+                {/* Room header with isolated, proper phone formatting */}
+                <header className="room-header">
+                  <button className="room-back" onClick={() => setActiveChat(null)} aria-label={t('common.back')}>
+                    <ArrowLeft size={20} />
+                  </button>
+                  <div className="room-avatar">
+                    {activePp.data ? (
+                      <img
+                        src={activePp.data}
+                        alt=""
+                        onError={() => activePp.refetch()}
+                      />
+                    ) : (
+                      <KindIcon kind={activeChat.kind} />
+                    )}
+                  </div>
+                  <div className="room-contact-info">
+                    <h3>{activeChat.name || activeChat.id.split('@')[0]}</h3>
+                    <span
+                      className="room-contact-phone"
+                      dir="ltr"
+                      style={{ unicodeBidi: 'isolate', direction: 'ltr', display: 'inline-block' }}
+                    >
+                      <bdi dir="ltr">
+                        {activePhoneText ??
+                          (activeChat.isGroup ? t('chats.groupSubtitle') : t('chats.privateContactSubtitle'))}
+                      </bdi>
+                    </span>
+                    <span
+                      className="room-contact-jid"
+                      dir="ltr"
+                      style={{ unicodeBidi: 'isolate', direction: 'ltr', display: 'inline-block' }}
+                      title={activeChat.id}
+                    >
+                      <bdi dir="ltr">{activeChat.id}</bdi>
+                    </span>
+                  </div>
+                </header>
+
+                {/* Messages thread */}
+                <ChatThread
+                  sessionId={selectedSessionId}
+                  activeChat={activeChat}
+                  messages={messages}
+                  loadingMessages={loadingMessages}
+                  messagesError={messagesError}
+                  messagesContainerRef={messagesContainerRef}
+                  hasMoreMessages={Boolean(hasMoreMessages)}
+                  loadingOlderMessages={loadingOlderMessages}
+                  onLoadOlderMessages={handleLoadOlderMessages}
+                  onMediaLoad={onMediaLoad}
+                  measureMedia={measureMedia}
+                  onOpenImage={messageId => {
+                    const idx = imageMedia.findIndex(x => x.id === messageId);
+                    if (idx >= 0) setLightboxIndex(idx);
+                  }}
+                  onReply={setReplyingTo}
+                  onReact={handleReactMessage}
+                  onDelete={handleDeleteMessage}
+                  onClickButton={handleClickButton}
+                />
+
+                {/* Chat composer */}
+                <ChatComposer
+                  selectedSessionId={selectedSessionId}
+                  activeChat={activeChat}
+                  replyingTo={replyingTo}
+                  setReplyingTo={setReplyingTo}
+                  onMessageAppended={onMessageAppended}
+                  onSent={promoteSentChat}
+                  messageInput={messageInput}
+                  setMessageInput={setMessageInput}
+                  attachment={attachment}
+                  setAttachment={setAttachment}
+                  previewUrl={previewUrl}
+                  setPreviewUrl={setPreviewUrl}
+                />
+              </div>
+            ) : activeChannel ? (
+              <div key={activeChannel.id} className="channel-room">
+                <header className="chats-room-header">
+                  <button className="room-back" onClick={() => setActiveChannel(null)} aria-label={t('common.back')}>
+                    <ArrowLeft size={20} />
+                  </button>
+                  <Megaphone size={20} />
+                  <h2 title={activeChannel.name}>{activeChannel.name}</h2>
+                </header>
+                <div className="messages-list" ref={channelFeedRef}>
+                  {channelMessages.isLoading ? (
+                    <div className="messages-loading">
+                      <Loader2 className="animate-spin" size={32} />
+                      <span>{t('chats.loadingMessages')}</span>
+                    </div>
+                  ) : channelMessages.error ? (
+                    <div className="messages-empty">
+                      <MessageSquare size={32} />
+                      <span>{t('chats.loadMessagesError')}</span>
+                    </div>
+                  ) : (channelMessages.data ?? []).length === 0 ? (
+                    <div className="messages-empty">
+                      <MessageSquare size={32} />
+                      <span>{t('chats.noMessagesInChat')}</span>
+                    </div>
+                  ) : (
+                    (channelMessages.data ?? []).map(m => (
+                      <div key={m.id} className="message-bubble incoming">
+                        {m.hasMedia &&
+                          (m.mediaUrl ? (
+                            <img className="channel-media" src={m.mediaUrl} alt="" />
+                          ) : (
+                            <span className="status-media-placeholder">{t('chats.status.mediaUnavailable')}</span>
+                          ))}
+                        {m.body && <MessageBody text={stripMentionDelimiters(m.body)} className="message-text" />}
+                        <span className="message-time">{formatChatTime(m.timestamp)}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            ) : activeStatusGroup ? (
+              <div key={activeStatusGroup.contact.id} className="channel-room">
+                <header className="chats-room-header">
+                  <button
+                    className="room-back"
+                    onClick={() => setActiveStatusContactId(null)}
+                    aria-label={t('common.back')}
+                  >
+                    <ArrowLeft size={20} />
+                  </button>
+                  <CircleDashed size={20} />
+                  <h2 title={activeStatusTitle}>{activeStatusTitle}</h2>
+                </header>
+                <div className="messages-list" ref={statusFeedRef}>
+                  {activeStatusGroup.items.map(item => (
+                    <div
+                      key={item.id}
+                      className="message-bubble incoming"
+                      style={
+                        item.type === 'text' && (item.backgroundColor || item.font)
+                          ? {
+                              ...(item.backgroundColor ? { backgroundColor: item.backgroundColor, color: '#fff' } : {}),
+                              ...statusFontStyle(item.font),
+                            }
+                          : undefined
+                      }
+                    >
+                      {item.mediaUrl && (
+                        <StatusMedia
+                          sessionId={selectedSessionId || null}
+                          statusId={item.id}
+                          type={item.type === 'video' ? 'video' : item.type === 'voice' ? 'audio' : 'image'}
+                        />
+                      )}
+                      {item.caption && (
+                        <MessageBody text={stripMentionDelimiters(item.caption)} className="message-text" />
+                      )}
+                      <span className="message-time">
+                        {formatChatTime(Math.floor(new Date(item.timestamp).getTime() / 1000))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="chats-room-placeholder">
+                <MessageSquare size={80} className="placeholder-icon" />
+                <h2>{t('chats.placeholderTitle')}</h2>
+                <p>{t('chats.placeholderDesc')}</p>
+              </div>
+            )}
+          </main>
+        </div>
+      )}
+
+      <MediaLightbox
+        items={imageMedia}
+        index={lightboxIndex}
+        onClose={() => setLightboxIndex(null)}
+        onNavigate={setLightboxIndex}
+      />
+
+      {composeOpen && (
+        <StatusComposeModal
+          sessionId={selectedSessionId}
+          onClose={() => setComposeOpen(false)}
+          onPosted={() => statusesQuery.refetch()}
+        />
+      )}
+    </div>
+  );
+}

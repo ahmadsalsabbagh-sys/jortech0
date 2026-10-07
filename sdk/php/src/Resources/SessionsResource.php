@@ -1,0 +1,196 @@
+<?php
+
+declare(strict_types=1);
+
+namespace OpenWA\Resources;
+
+use OpenWA\Http\HttpExecutor;
+
+/**
+ * Sessions resource — lifecycle management for WhatsApp sessions.
+ *
+ * Backed by src/modules/session/session.controller.ts.
+ */
+class SessionsResource
+{
+    private HttpExecutor $http;
+
+    public function __construct(HttpExecutor $http)
+    {
+        $this->http = $http;
+    }
+
+    /**
+     * @param array<string,mixed> $query Optional pagination `limit`, `offset`, and `name` for an exact, case-sensitive session name.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function list(array $query = []): array
+    {
+        return $this->http->request('GET', '/api/sessions', $query) ?? [];
+    }
+
+    /**
+     * Read a session's effective configuration.
+     *
+     * @return array<string,mixed>
+     */
+    public function getConfig(string $id): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($id)}/config");
+    }
+
+    /**
+     * Update a session's configuration, in any state, without a restart, re-link or QR scan (all three
+     * fields were fixed at creation before this route existed). `autoRejectCalls` applies immediately;
+     * `maxReconnectAttempts` and `reconnectBaseDelay` apply on the next start.
+     *
+     * @param array<string,mixed> $body autoRejectCalls, maxReconnectAttempts, reconnectBaseDelay
+     *
+     * @return array<string,mixed>
+     */
+    public function updateConfig(string $id, array $body): array
+    {
+        return $this->http->request('PATCH', "/api/sessions/{$this->http->encodeSegment($id)}/config", [], $body);
+    }
+
+    /**
+     * Read a session's masked proxy configuration (credentials never returned).
+     *
+     * @return array{enabled: bool, proxyType: ?string, proxyHost: ?string, hasCredentials: bool}
+     */
+    public function getProxy(string $id): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($id)}/proxy");
+    }
+
+    /**
+     * Update per-session proxy settings. No restart — changes apply on the next start.
+     * Send proxyUrl: null to clear. Unscoped ADMIN key required.
+     *
+     * @param array{proxyUrl?: ?string} $body
+     * @return array{enabled: bool, proxyType: ?string, proxyHost: ?string, hasCredentials: bool}
+     */
+    public function updateProxy(string $id, array $body): array
+    {
+        return $this->http->request('PATCH', "/api/sessions/{$this->http->encodeSegment($id)}/proxy", [], $body);
+    }
+
+    /** @return array<string,mixed> */
+    public function get(string $id): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($id)}");
+    }
+
+    /**
+     * Create a session. Requires an OPERATOR-level key; setting proxyUrl requires an ADMIN key.
+     *
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public function create(array $body): array
+    {
+        // config is a map: an empty PHP array would serialize as a JSON list [] and be rejected by the
+        // gateway's object validation. Cast the empty map to stdClass so it encodes as {}.
+        if (isset($body['config']) && $body['config'] === []) {
+            $body['config'] = new \stdClass();
+        }
+        return $this->http->request('POST', '/api/sessions', [], $body);
+    }
+
+    public function delete(string $id): void
+    {
+        $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($id)}");
+    }
+
+    /** @return array<string,mixed> */
+    public function start(string $id): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/start");
+    }
+
+    /**
+     * Stop a session and disconnect gracefully. Throws on HTTP 502 with
+     * `code: 'SESSION_STOP_INCOMPLETE'` when the session was stopped locally but the engine
+     * teardown did not complete (the graceful disconnect and the force-destroy escalation both
+     * failed, so the engine process may still be running); the status is settled to
+     * `disconnected` and no success audit is written. Retry the stop; restart the node to reap
+     * a leaked process.
+     *
+     * @return array<string,mixed>
+     */
+    public function stop(string $id): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/stop");
+    }
+
+    /**
+     * Attempt an engine-native unlink of this device, then stop the session. A 200 means the
+     * unlink operation AND the required local credential cleanup completed — it is not an
+     * independent observation that the handset UI no longer shows the linked device. Because a
+     * completed unlink wipes the stored credentials, a later start() requires a fresh QR scan or
+     * pairing code. Requires a running session. Throws on HTTP 502 with
+     * `code: 'SESSION_LOGOUT_INCOMPLETE'` when the session was stopped locally but the logout
+     * operation did not complete (no send, no acknowledgement, timeout/transport error, or local
+     * cleanup failure); `phone` is cleared and no success audit is written. Start the session
+     * again and retry the logout; do not assume the retry reconnects automatically or lands in a
+     * guaranteed QR state.
+     *
+     * @return array<string,mixed>
+     */
+    public function logout(string $id): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/logout");
+    }
+
+    /**
+     * Force-kill a stuck session (SIGKILL + teardown). Throws with HTTP 502 and
+     * getErrorCode() 'SESSION_FORCE_KILL_INCOMPLETE' when the session was stopped
+     * locally but the force-destroy threw or timed out, so the engine process may
+     * still be running; the status is settled to disconnected and a retry answers 400
+     * because no engine is left to kill. Restart the node to reap a leaked process.
+     *
+     * @return array<string,mixed>
+     */
+    public function forceKill(string $id): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/force-kill");
+    }
+
+    /** @return array<string,mixed> */
+    public function getQrCode(string $id): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($id)}/qr");
+    }
+
+    /**
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public function requestPairingCode(string $id, array $body): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/pairing-code", [], $body);
+    }
+
+    /** @return array<string,mixed> */
+    public function stats(): array
+    {
+        return $this->http->request('GET', '/api/sessions/stats/overview');
+    }
+
+    /**
+     * Set the account's own global presence — appear online, or offline.
+     *
+     * `available: false` hands notifications back to the phone: a linked device that stays online
+     * suppresses the phone's own alerts. This is the ACCOUNT's presence, not a chat's — see
+     * ChatsResource for per-chat typing/recording states.
+     *
+     * @param array{available:bool} $body
+     * @return array<string,mixed>
+     */
+    public function setOnlinePresence(string $id, array $body): array
+    {
+        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($id)}/presence", [], $body);
+    }
+
+}

@@ -1,0 +1,81 @@
+import { DECORATORS } from '@nestjs/swagger';
+import { validateSync } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
+import { SearchQueryDto } from './search-query.dto';
+import { SEARCH_OFFSET_MAX } from '../search.constants';
+
+describe('SearchQueryDto', () => {
+  // Mirrors how the global ValidationPipe (transform:true + enableImplicitConversion) instantiates
+  // the DTO from a query-string-shaped plain object: @Type(() => Number) coerces strings to numbers
+  // before class-validator runs.
+  const fromQuery = (query: Record<string, unknown>): SearchQueryDto => plainToInstance(SearchQueryDto, query);
+
+  it('coerces numeric query-string fields to numbers', () => {
+    const dto = fromQuery({ q: 'hello', limit: '5', offset: '10', dateFrom: '1000', dateTo: '2000' });
+    expect(dto.limit).toBe(5);
+    expect(dto.offset).toBe(10);
+    expect(dto.dateFrom).toBe(1000);
+    expect(dto.dateTo).toBe(2000);
+  });
+
+  it('rejects a non-numeric limit — the ?limit=abc → 400 path (Number(abc) is NaN, fails @IsNumber)', () => {
+    const dto = fromQuery({ q: 'hello', limit: 'abc' });
+    const errors = validateSync(dto);
+    expect(errors.some(e => e.property === 'limit')).toBe(true);
+  });
+
+  it('rejects a non-numeric offset', () => {
+    const dto = fromQuery({ q: 'hello', offset: 'xyz' });
+    expect(validateSync(dto).some(e => e.property === 'offset')).toBe(true);
+  });
+
+  // Both are bound straight into LIMIT ? OFFSET ?, where SQLite and PostgreSQL reject a fraction with a
+  // 500; the DTO must stop it as a 400.
+  it('rejects a fractional limit or offset', () => {
+    expect(validateSync(fromQuery({ q: 'hello', limit: '1.5' })).some(e => e.property === 'limit')).toBe(true);
+    expect(validateSync(fromQuery({ q: 'hello', offset: '0.5' })).some(e => e.property === 'offset')).toBe(true);
+  });
+
+  it('rejects limit < 1 (@Min(1))', () => {
+    const dto = fromQuery({ q: 'hello', limit: '0' });
+    expect(validateSync(dto).some(e => e.property === 'limit')).toBe(true);
+  });
+
+  it('rejects offset < 0 (@Min(0))', () => {
+    const dto = fromQuery({ q: 'hello', offset: '-1' });
+    expect(validateSync(dto).some(e => e.property === 'offset')).toBe(true);
+  });
+
+  it('rejects offset above SEARCH_OFFSET_MAX instead of letting the service clamp it to a repeated page', () => {
+    expect(validateSync(fromQuery({ q: 'hello', offset: '100001' })).some(e => e.property === 'offset')).toBe(true);
+    expect(validateSync(fromQuery({ q: 'hello', offset: '100000' }))).toHaveLength(0);
+  });
+
+  it('rejects an invalid direction (@IsEnum(MessageDirection))', () => {
+    const dto = fromQuery({ q: 'hello', direction: 'sideways' });
+    expect(validateSync(dto).some(e => e.property === 'direction')).toBe(true);
+  });
+
+  it('accepts a valid direction', () => {
+    const dto = fromQuery({ q: 'hello', direction: 'incoming' });
+    expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  it('rejects an empty q (@IsNotEmpty)', () => {
+    const dto = fromQuery({ q: '' });
+    expect(validateSync(dto).some(e => e.property === 'q')).toBe(true);
+  });
+
+  it('accepts a minimal valid query with only q', () => {
+    const dto = fromQuery({ q: 'hello' });
+    expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  // @nestjs/swagger derives no bounds from @IsInt/@Min/@Max, so the decorator has to state them.
+  it('publishes limit and offset as bounded integers', () => {
+    const published = (key: string): unknown =>
+      Reflect.getMetadata(DECORATORS.API_MODEL_PROPERTIES, SearchQueryDto.prototype, key);
+    expect(published('limit')).toMatchObject({ type: 'integer', minimum: 1 });
+    expect(published('offset')).toMatchObject({ type: 'integer', minimum: 0, maximum: SEARCH_OFFSET_MAX });
+  });
+});

@@ -1,0 +1,1444 @@
+#!/usr/bin/env bash
+# Smoke test: scripts/backup.sh + scripts/restore.sh.
+#
+# Covers:
+#   (a) custom MAIN_DATABASE_NAME / DATABASE_NAME are honored by BOTH scripts
+#   (b) a missing source database fails hard (non-zero, clear message, no archive)
+#   (c) backup -> restore roundtrip via sqlite3 .backup (skipped with a notice when the host
+#       has no sqlite3 — everything else still runs)
+#   (d) the cp fallback writes a CONSISTENCY-WARNING marker into the archive, restore warns
+#       but continues, and restore --strict refuses
+#   (e) the archive min-content check rejects (and deletes) an archive missing a required DB
+#   (f) data/.env.generated supplies paths the environment does not, and restore reads the archive's copy
+#   (g) PLUGIN_STATE_DIR plugin state is archived and restored at the configured root
+#   (h) restore refuses a live target without --force, before touching anything
+#   (i) the data-store half of that guard refuses on its own
+#   (j) a probe that fails or prints no usable count leaves the target counted as live
+#   (k) an operator's sqlite3 rc file changes neither answer of the guard (skipped without sqlite3)
+#   (l) an unwritable BACKUP_DIR fails before anything is staged (skipped as root)
+#   (m) OPENWA_RESTORE_SNAPSHOT_DIR takes the data-dir snapshot off a read-only parent (skipped as root)
+#   (n) a state dir outside the data dir is snapshotted before any database is written, and under
+#       OPENWA_RESTORE_SNAPSHOT_DIR when that is set (skipped as root)
+#   (o) such a state dir under a read-only parent, a mount point in the container, is restored in
+#       place (skipped as root)
+#   (p) a symlinked database target or data dir is snapshotted as a copy of what the link points at
+#   (q) a leftover -wal is cleared before a database is restored and kept in its snapshot (skipped
+#       without sqlite3)
+#   (r) a symlinked state dir is archived by content and restored through the link, and an archive
+#       member that is itself a symlink is refused
+#   (s) restored state lands where the restored data/.env.generated points, below ./.env
+#   (t) ./.env lines with CRLF endings, blanks around = or trailing blanks resolve as dotenv reads them,
+#       and a `KEY: value` line is reported
+#   (u) a state, database or data-dir file target the restore cannot write stops it before any database
+#       is written (skipped as root)
+#   (v) a leftover STORAGE_LOCAL_PATH=./uploads the app cannot create falls back to ./data/media in
+#       both scripts, and a missing media dir is reported (skipped as root)
+#   (w) the default colocated plugins dir is rebuilt from both archive members, even when they differ
+#   (x) a relocated BOOTSTRAP_KEY_FILE is archived and restored there, and an unwritable one is refused
+#       before any database is written (that half skipped as root)
+#   (y) plugin packages in the legacy ./plugins, which the archive does not carry, are reported
+#   (z) a leftover ./uploads that was never created, beside an existing ./data/media, resolves there in
+#       both scripts whatever the uid
+#   (aa) engine auth state copied from a running app (an open whatsapp-web.js profile, Baileys state)
+#       is noted in the archive and printed by restore, which does not refuse it even with --strict
+#   (ab) a blank ./.env line keeps data/.env.generated from supplying the key, so the default applies
+#   (ac) a missing Baileys auth dir is reported when data/.env.generated selects the Baileys engine
+#   (ad) a file an engine deletes during the sessions/ or baileys/ copy is noted instead of failing the
+#       backup, a file the app deletes during the media or plugin copies is logged, and any other cp
+#       error still fails it, however long its output and whatever the host's locale
+#   (ae) the min-content check passes an archive whose listing outgrows a pipe buffer
+#   (af) the online SQLite backup waits out a writer holding the database lock (skipped without sqlite3)
+#   (ag) quoted values, inline comments and `KEY=""` in ./.env resolve as dotenv reads them, and a line
+#       the scripts cannot parse ends the lookup at the default instead of reading data/.env.generated
+#
+# Usage: ./scripts/smoke-test-backup-restore.sh
+# Requires: bash, tar, node (restore.sh path resolution). sqlite3 is optional (see (c) and (k)).
+set -euo pipefail
+
+# backup.sh and restore.sh take these from the environment before anything else. An exported value
+# would aim a case at a real install, and restore replaces the state directories wholesale, so every
+# case starts from none of them and sets exactly the paths it uses.
+unset OPENWA_DATA_DIR BACKUP_DIR DATABASE_TYPE MAIN_DATABASE_NAME DATABASE_NAME SESSION_DATA_PATH \
+  BAILEYS_AUTH_DIR STORAGE_LOCAL_PATH PLUGINS_DIR PLUGIN_STATE_DIR OPENWA_RESTORE_SNAPSHOT_DIR BOOTSTRAP_KEY_FILE
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BACKUP="$REPO_ROOT/scripts/backup.sh"
+RESTORE="$REPO_ROOT/scripts/restore.sh"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+HAS_SQLITE3=0
+if command -v sqlite3 >/dev/null 2>&1; then
+  HAS_SQLITE3=1
+fi
+
+pass() { echo "PASS: $*"; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# A fixture database: a real SQLite file with a sentinel row when sqlite3 is available (backup.sh
+# uses .backup then, which refuses non-database files), else a plain marker file for the cp path.
+make_fixture() {
+  if [ "$HAS_SQLITE3" -eq 1 ]; then
+    sqlite3 "$1" "CREATE TABLE sentinel(payload TEXT); INSERT INTO sentinel VALUES('$2');"
+  else
+    printf 'sentinel:%s\n' "$2" >"$1"
+  fi
+}
+
+# Content fingerprint that works for both fixture kinds above. sqlite3 .backup does NOT guarantee
+# a byte-identical copy, so never cmp(1) databases that went through it.
+db_fingerprint() {
+  if [ "$HAS_SQLITE3" -eq 1 ]; then
+    sqlite3 "$1" "SELECT payload FROM sentinel;"
+  else
+    sed 's/^sentinel://' "$1"
+  fi
+}
+
+# A PATH farm with every tool backup.sh needs. Used to hide sqlite3 (forcing the cp fallback) or
+# to shadow tar (simulating an incomplete archive) without touching the real scripts.
+populate_shim() {
+  shim_dir="$1"
+  tools="env bash sh cp tar gzip mktemp date rm sed mkdir ls cat chmod grep printf uname dirname"
+  if [ "${2:-}" = "with-sqlite3" ]; then
+    tools="$tools sqlite3"
+  fi
+  for tool in $tools; do
+    src="$(command -v "$tool" 2>/dev/null || true)"
+    if [ -n "$src" ]; then
+      ln -sf "$src" "$shim_dir/$tool"
+    fi
+  done
+}
+
+echo "==> (a) custom MAIN_DATABASE_NAME / DATABASE_NAME are honored"
+A="$WORK/a"
+mkdir -p "$A/custom" "$A/state" "$A/restore"
+make_fixture "$A/custom/auth.sqlite" "alpha-main"
+make_fixture "$A/custom/store.sqlite" "alpha-data"
+(
+  cd "$A"
+  MAIN_DATABASE_NAME="$A/custom/auth.sqlite" \
+    DATABASE_NAME="$A/custom/store.sqlite" \
+    OPENWA_DATA_DIR="$A/state" \
+    BACKUP_DIR="$A/out" \
+    "$BACKUP" >/dev/null
+)
+ARCHIVE_A="$(ls "$A"/out/openwa-backup-*.tar.gz)"
+if ! tar -tzf "$ARCHIVE_A" | grep -qx './main.sqlite'; then
+  fail "(a) archive missing ./main.sqlite"
+fi
+if ! tar -tzf "$ARCHIVE_A" | grep -qx './openwa.sqlite'; then
+  fail "(a) archive missing ./openwa.sqlite"
+fi
+(
+  cd "$A/restore"
+  MAIN_DATABASE_NAME="$A/restore/custom-main.sqlite" \
+    DATABASE_NAME="$A/restore/custom-data.sqlite" \
+    OPENWA_DATA_DIR="$A/restore/state" \
+    "$RESTORE" "$ARCHIVE_A" >/dev/null
+)
+if [ "$(db_fingerprint "$A/restore/custom-main.sqlite")" != "alpha-main" ]; then
+  fail "(a) main DB not restored to the MAIN_DATABASE_NAME path"
+fi
+if [ "$(db_fingerprint "$A/restore/custom-data.sqlite")" != "alpha-data" ]; then
+  fail "(a) data DB not restored to the DATABASE_NAME path"
+fi
+pass "(a) env-resolved DB paths honored by backup.sh and restore.sh"
+
+echo ""
+echo "==> (b) missing source database fails hard"
+B="$WORK/b"
+mkdir -p "$B"
+set +e
+OUT_B="$(cd "$B" && OPENWA_DATA_DIR="$B/state" BACKUP_DIR="$B/out" "$BACKUP" 2>&1)"
+RC_B=$?
+set -e
+if [ "$RC_B" -eq 0 ]; then
+  fail "(b) backup.sh exited 0 with no database present (silent empty backup)"
+fi
+if ! printf '%s' "$OUT_B" | grep -q 'main.sqlite'; then
+  fail "(b) error message does not name the missing main database"
+fi
+if [ -n "$(ls "$B/out" 2>/dev/null || true)" ]; then
+  fail "(b) an archive was written despite the missing database"
+fi
+# Only the data store missing (default paths) must also fail, naming openwa.sqlite.
+B2="$WORK/b2"
+mkdir -p "$B2/data"
+make_fixture "$B2/data/main.sqlite" "b2-main"
+set +e
+OUT_B2="$(cd "$B2" && BACKUP_DIR="$B2/out" "$BACKUP" 2>&1)"
+RC_B2=$?
+set -e
+if [ "$RC_B2" -eq 0 ]; then
+  fail "(b) backup.sh exited 0 with the data store missing"
+fi
+if ! printf '%s' "$OUT_B2" | grep -q 'openwa.sqlite'; then
+  fail "(b) error message does not name the missing data store"
+fi
+pass "(b) missing DB -> non-zero exit, clear message, no archive"
+
+echo ""
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  echo "==> (c) backup -> restore roundtrip via sqlite3 .backup (default paths)"
+  C="$WORK/c"
+  mkdir -p "$C/src/data" "$C/dst"
+  sqlite3 "$C/src/data/main.sqlite" "CREATE TABLE sentinel(payload TEXT); INSERT INTO sentinel VALUES('c-main');"
+  sqlite3 "$C/src/data/openwa.sqlite" "CREATE TABLE sentinel(payload TEXT); INSERT INTO sentinel VALUES('c-data');"
+  (
+    cd "$C/src"
+    BACKUP_DIR="$C/out" "$BACKUP" >/dev/null
+  )
+  ARCHIVE_C="$(ls "$C"/out/openwa-backup-*.tar.gz)"
+  if tar -tzf "$ARCHIVE_C" | grep -q 'CONSISTENCY-WARNING'; then
+    fail "(c) unexpected CONSISTENCY-WARNING marker with sqlite3 present"
+  fi
+  (
+    cd "$C/dst"
+    "$RESTORE" "$ARCHIVE_C" >/dev/null
+  )
+  if [ "$(sqlite3 "$C/dst/data/main.sqlite" 'SELECT payload FROM sentinel;')" != "c-main" ]; then
+    fail "(c) main DB contents did not survive the roundtrip"
+  fi
+  if [ "$(sqlite3 "$C/dst/data/openwa.sqlite" 'SELECT payload FROM sentinel;')" != "c-data" ]; then
+    fail "(c) data store contents did not survive the roundtrip"
+  fi
+  pass "(c) .backup roundtrip preserves database contents"
+else
+  echo "SKIP: (c) sqlite3 not found on this host — skipping the .backup roundtrip"
+fi
+
+echo ""
+echo "==> (d) cp fallback marker + restore warning + --strict refusal"
+D="$WORK/d"
+mkdir -p "$D/src/data" "$D/shim" "$D/dst"
+# Plain files are fine here: the shim PATH hides sqlite3, so backup.sh takes the cp branch
+# regardless of what the host provides.
+printf 'd-main\n' >"$D/src/data/main.sqlite"
+printf 'd-data\n' >"$D/src/data/openwa.sqlite"
+populate_shim "$D/shim"
+(
+  cd "$D/src"
+  PATH="$D/shim" BACKUP_DIR="$D/out" "$BACKUP" >"$D/backup.log" 2>&1
+)
+ARCHIVE_D="$(ls "$D"/out/openwa-backup-*.tar.gz)"
+if ! tar -tzf "$ARCHIVE_D" | grep -q 'CONSISTENCY-WARNING'; then
+  fail "(d) fallback archive does not carry the CONSISTENCY-WARNING marker"
+fi
+if ! grep -q 'sqlite3' "$D/backup.log"; then
+  fail "(d) backup.sh did not print the loud fallback warning"
+fi
+OUT_D="$(cd "$D/dst" && "$RESTORE" "$ARCHIVE_D" 2>&1)"
+if ! printf '%s' "$OUT_D" | grep -q 'CONSISTENCY-WARNING'; then
+  fail "(d) restore.sh did not surface the consistency warning"
+fi
+if [ "$(cat "$D/dst/data/main.sqlite")" != "d-main" ]; then
+  fail "(d) fallback archive did not restore the main DB"
+fi
+set +e
+OUT_DS="$(cd "$D/dst" && "$RESTORE" "$ARCHIVE_D" --strict 2>&1)"
+RC_DS=$?
+set -e
+if [ "$RC_DS" -eq 0 ]; then
+  fail "(d) restore --strict exited 0 on a marked archive"
+fi
+if ! printf '%s' "$OUT_DS" | grep -q -- '--strict'; then
+  fail "(d) --strict refusal message is not explicit"
+fi
+pass "(d) fallback marker written, restore warns and continues, --strict refuses"
+
+echo ""
+echo "==> (e) archive min-content check rejects an incomplete archive"
+E="$WORK/e"
+mkdir -p "$E/src/data" "$E/shim"
+make_fixture "$E/src/data/main.sqlite" "e-main"
+make_fixture "$E/src/data/openwa.sqlite" "e-data"
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  populate_shim "$E/shim" with-sqlite3
+else
+  populate_shim "$E/shim"
+fi
+# Shadow tar: create the archive WITHOUT ./openwa.sqlite to simulate a truncated backup.
+# (remove the populate_shim symlink first — writing through it would target the real tar)
+rm -f "$E/shim/tar"
+REAL_TAR="$(command -v tar)"
+cat >"$E/shim/tar" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "-czf" ]; then
+  out="\$2"
+  shift 2
+  exec "$REAL_TAR" -czf "\$out" --exclude='./openwa.sqlite' "\$@"
+fi
+exec "$REAL_TAR" "\$@"
+EOF
+chmod +x "$E/shim/tar"
+set +e
+OUT_E="$(cd "$E/src" && PATH="$E/shim" BACKUP_DIR="$E/out" "$BACKUP" 2>&1)"
+RC_E=$?
+set -e
+if [ "$RC_E" -eq 0 ]; then
+  fail "(e) min-content check passed an archive missing openwa.sqlite"
+fi
+if ! printf '%s' "$OUT_E" | grep -q 'openwa.sqlite'; then
+  fail "(e) error message does not name the missing archive member"
+fi
+if [ -n "$(ls "$E/out" 2>/dev/null || true)" ]; then
+  fail "(e) the defective archive was left on disk"
+fi
+pass "(e) min-content check fails hard and removes the defective archive"
+
+echo ""
+echo "==> (f) data/.env.generated supplies paths the environment does not"
+# The dangerous shape: the app was pointed elsewhere through the dashboard, and a database from
+# before that switch is still sitting at the DEFAULT path. Resolving from the process environment
+# alone then archives the abandoned file and exits 0 — a backup that only reveals itself as wrong
+# during a restore. A missing default would at least fail loudly; a stale one does not.
+F="$WORK/f"
+mkdir -p "$F/state" "$F/live" "$F/data" "$F/extract" "$F/restore/state"
+make_fixture "$F/live/auth.sqlite" "foxtrot-live-main"
+make_fixture "$F/live/store.sqlite" "foxtrot-live-data"
+make_fixture "$F/data/main.sqlite" "STALE-main"
+make_fixture "$F/data/openwa.sqlite" "STALE-data"
+printf 'DATABASE_TYPE=sqlite\nMAIN_DATABASE_NAME=%s\nDATABASE_NAME=%s\n' \
+  "$F/live/auth.sqlite" "$F/live/store.sqlite" >"$F/state/.env.generated"
+(
+  cd "$F"
+  OPENWA_DATA_DIR="$F/state" BACKUP_DIR="$F/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_F="$(ls "$F"/out/openwa-backup-*.tar.gz)"
+tar -xzf "$ARCHIVE_F" -C "$F/extract"
+if [ "$(db_fingerprint "$F/extract/main.sqlite")" != "foxtrot-live-main" ]; then
+  fail "(f) backup archived the stale default main DB instead of the one data/.env.generated names"
+fi
+if [ "$(db_fingerprint "$F/extract/openwa.sqlite")" != "foxtrot-live-data" ]; then
+  fail "(f) backup archived the stale default data DB instead of the one data/.env.generated names"
+fi
+# restore.sh must read the same layer, from the file in effect AFTER the restore: the archive's
+# .env.generated replaces the target's, so databases placed where the target's old file pointed
+# would be ones the restored app never opens. Here the live databases are gone, as in a disaster
+# recovery, and the target's own file still names other paths.
+rm -f "$F/live/auth.sqlite" "$F/live/store.sqlite"
+printf 'DATABASE_TYPE=sqlite\nMAIN_DATABASE_NAME=%s\nDATABASE_NAME=%s\n' \
+  "$F/restore/auth.sqlite" "$F/restore/store.sqlite" >"$F/restore/state/.env.generated"
+(
+  cd "$F/restore"
+  OPENWA_DATA_DIR="$F/restore/state" "$RESTORE" "$ARCHIVE_F" >/dev/null
+)
+if [ "$(db_fingerprint "$F/live/auth.sqlite")" != "foxtrot-live-main" ]; then
+  fail "(f) restore ignored the MAIN_DATABASE_NAME in the archive's data/.env.generated"
+fi
+if [ "$(db_fingerprint "$F/live/store.sqlite")" != "foxtrot-live-data" ]; then
+  fail "(f) restore ignored the DATABASE_NAME in the archive's data/.env.generated"
+fi
+if [ -e "$F/restore/auth.sqlite" ] || [ -e "$F/restore/store.sqlite" ]; then
+  fail "(f) restore wrote the databases where the replaced data/.env.generated pointed"
+fi
+# An explicit environment value must still win — that is the app's precedence, not ours to change.
+(
+  cd "$F"
+  MAIN_DATABASE_NAME="$F/data/main.sqlite" DATABASE_NAME="$F/data/openwa.sqlite" \
+    OPENWA_DATA_DIR="$F/state" BACKUP_DIR="$F/out2" "$BACKUP" >/dev/null
+)
+rm -rf "${F:?}/extract2" && mkdir -p "$F/extract2"
+tar -xzf "$(ls "$F"/out2/openwa-backup-*.tar.gz)" -C "$F/extract2"
+if [ "$(db_fingerprint "$F/extract2/main.sqlite")" != "STALE-main" ]; then
+  fail "(f) an explicit environment path lost to data/.env.generated — precedence is inverted"
+fi
+pass "(f) data/.env.generated resolves paths for both scripts, and the environment still wins"
+
+echo ""
+echo "==> (g) PLUGIN_STATE_DIR moves the registry and ctx.storage, and both scripts follow it"
+# The knob names the ROOT; the app keeps plugin state at <root>/plugins. Both scripts hardcoded
+# $OPENWA_DATA_DIR/plugins, so with the knob set the archive carried neither the registry nor any
+# plugin's persisted storage, and the restore put nothing back. Silent both ways: an empty source
+# directory simply produces no plugin-state entry.
+G="$WORK/g"
+mkdir -p "$G/state" "$G/elsewhere/plugins/chatwoot" "$G/extract" "$G/restore/state"
+make_fixture "$G/state/main.sqlite" "golf-main"
+make_fixture "$G/state/openwa.sqlite" "golf-data"
+printf '{"plugins":[{"id":"chatwoot"}]}' >"$G/elsewhere/plugins/registry.json"
+printf 'mapped-conversation' >"$G/elsewhere/plugins/chatwoot/key-Zm9v.json"
+(
+  cd "$G"
+  OPENWA_DATA_DIR="$G/state" PLUGIN_STATE_DIR="$G/elsewhere" BACKUP_DIR="$G/out" \
+    MAIN_DATABASE_NAME="$G/state/main.sqlite" DATABASE_NAME="$G/state/openwa.sqlite" "$BACKUP" >/dev/null
+)
+ARCHIVE_G="$(ls "$G"/out/openwa-backup-*.tar.gz)"
+tar -xzf "$ARCHIVE_G" -C "$G/extract"
+if [ ! -f "$G/extract/plugin-state/registry.json" ]; then
+  fail "(g) backup ignored PLUGIN_STATE_DIR: the plugin registry is missing from the archive"
+fi
+if [ ! -f "$G/extract/plugin-state/chatwoot/key-Zm9v.json" ]; then
+  fail "(g) backup ignored PLUGIN_STATE_DIR: a plugin's persisted ctx.storage is missing"
+fi
+# And the restore has to put them back where the knob points, not under the default data dir.
+(
+  cd "$G"
+  OPENWA_DATA_DIR="$G/restore/state" PLUGIN_STATE_DIR="$G/restored-elsewhere" \
+    MAIN_DATABASE_NAME="$G/restore/state/main.sqlite" DATABASE_NAME="$G/restore/state/openwa.sqlite" \
+    "$RESTORE" "$ARCHIVE_G" --force >/dev/null
+)
+if [ ! -f "$G/restored-elsewhere/plugins/registry.json" ]; then
+  fail "(g) restore ignored PLUGIN_STATE_DIR: the registry did not land under the configured root"
+fi
+pass "(g) PLUGIN_STATE_DIR is honoured by backup and by restore"
+
+echo ""
+echo "==> (h) restore refuses a live target without --force, before touching anything"
+# The data-loss guard: both target databases hold a working install's data, so a plain restore
+# must refuse (non-zero, clear message) before ANY state changes, and --force must be the exact
+# switch that changes the answer.
+H="$WORK/h"
+mkdir -p "$H/src/data" "$H/live" "$H/out"
+make_fixture "$H/src/data/main.sqlite" "hotel-archive-main"
+make_fixture "$H/src/data/openwa.sqlite" "hotel-archive-data"
+(
+  cd "$H/src"
+  BACKUP_DIR="$H/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_H="$(ls "$H"/out/openwa-backup-*.tar.gz)"
+make_fixture "$H/live/main.sqlite" "hotel-live-main"
+make_fixture "$H/live/openwa.sqlite" "hotel-live-data"
+set +e
+OUT_H="$(cd "$H" && MAIN_DATABASE_NAME="$H/live/main.sqlite" \
+  DATABASE_NAME="$H/live/openwa.sqlite" OPENWA_DATA_DIR="$H/live" \
+  "$RESTORE" "$ARCHIVE_H" 2>&1)"
+RC_H=$?
+set -e
+if [ "$RC_H" -eq 0 ]; then
+  fail "(h) restore exited 0 on a live target without --force"
+fi
+# ASCII anchors only: the second refusal line carries a UTF-8 dash that must not be grep'd.
+if ! printf '%s' "$OUT_H" | grep -q 'appear live'; then
+  fail "(h) refusal message does not say the target appears live"
+fi
+if ! printf '%s' "$OUT_H" | grep -q -- '--force'; then
+  fail "(h) refusal message does not point at --force"
+fi
+if ! printf '%s' "$OUT_H" | grep -qF "$H/live/main.sqlite"; then
+  fail "(h) refusal message does not name the live target"
+fi
+if [ "$(db_fingerprint "$H/live/main.sqlite")" != "hotel-live-main" ]; then
+  fail "(h) the refused restore modified the live main DB"
+fi
+if [ "$(db_fingerprint "$H/live/openwa.sqlite")" != "hotel-live-data" ]; then
+  fail "(h) the refused restore modified the live data DB"
+fi
+# $H/live is non-empty, so an execution that reached the safety-snapshot step would have left a
+# $H/live.pre-restore-* sibling; its absence proves the guard fired before any state was touched.
+if [ -n "$(ls -d "$H"/live.pre-restore-* 2>/dev/null || true)" ]; then
+  fail "(h) the refused restore left a pre-restore snapshot behind"
+fi
+(
+  cd "$H"
+  MAIN_DATABASE_NAME="$H/live/main.sqlite" DATABASE_NAME="$H/live/openwa.sqlite" \
+    OPENWA_DATA_DIR="$H/live" "$RESTORE" "$ARCHIVE_H" --force >/dev/null
+)
+if [ "$(db_fingerprint "$H/live/main.sqlite")" != "hotel-archive-main" ]; then
+  fail "(h) --force did not overwrite the live main DB after the refusal"
+fi
+if [ "$(db_fingerprint "$H/live/openwa.sqlite")" != "hotel-archive-data" ]; then
+  fail "(h) --force did not overwrite the live data DB after the refusal"
+fi
+pass "(h) live target refused before any state was touched; --force overwrites"
+
+echo ""
+echo "==> (i) the data-store half of the guard refuses on its own"
+# (h) makes both databases live, so its main-DB check alone satisfies every assertion there. Here the
+# data store is the only database present.
+I="$WORK/i"
+mkdir -p "$I/bin" "$I/live"
+make_fixture "$I/live/openwa.sqlite" "india-live-data"
+
+# guarded_restore <target dir>: restore ARCHIVE_H without --force over <dir>/main.sqlite and
+# <dir>/openwa.sqlite, with $I/bin first on PATH. Output lands in OUT, the exit code in RC.
+guarded_restore() {
+  set +e
+  OUT="$(cd "$WORK" && PATH="$I/bin:$PATH" MAIN_DATABASE_NAME="$1/main.sqlite" \
+    DATABASE_NAME="$1/openwa.sqlite" OPENWA_DATA_DIR="$1" "$RESTORE" "$ARCHIVE_H" 2>&1)"
+  RC=$?
+  set -e
+}
+
+# expect_refused <label>: a restore over $I/live must refuse, name its data store, and leave it intact.
+expect_refused() {
+  guarded_restore "$I/live"
+  if [ "$RC" -eq 0 ]; then
+    fail "($1) restore exited 0 over a live data store without --force"
+  fi
+  if ! printf '%s' "$OUT" | grep -qF "$I/live/openwa.sqlite"; then
+    fail "($1) refusal message does not name the live data store"
+  fi
+  if [ "$(db_fingerprint "$I/live/openwa.sqlite")" != "india-live-data" ]; then
+    fail "($1) the refused restore modified the live data store"
+  fi
+}
+
+expect_refused i
+pass "(i) a live data store is refused with the main DB target absent"
+
+echo ""
+echo "==> (j) a probe that fails or prints no usable count leaves the target counted as live"
+# A locked, corrupt or unreadable database makes sqlite3 exit non-zero, and output that is not a bare
+# count did not answer the question. Neither may be read as an empty database.
+for probe in 'exit 26' 'exit 0' 'printf "count(*)\n1\n"'; do
+  printf '#!/usr/bin/env bash\n%s\n' "$probe" >"$I/bin/sqlite3"
+  chmod +x "$I/bin/sqlite3"
+  expect_refused "j: $probe"
+done
+rm -f "$I/bin/sqlite3"
+pass "(j) a failed, empty or non-numeric probe refuses"
+
+echo ""
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  echo "==> (k) an operator's sqlite3 rc file changes neither answer of the guard"
+  # sqlite3 applies the user's rc file to a one-shot query too, and headers or csv mode turn the count
+  # into text. It finds that file through the passwd entry, not $HOME, so a test cannot plant one by
+  # moving HOME. The wrapper loads one with -init instead; an explicit -init later on the command line
+  # replaces it, exactly as it replaces ~/.sqliterc.
+  printf '.headers on\n.mode csv\n' >"$I/sqliterc"
+  printf '#!/usr/bin/env bash\nexec %q -init %q "$@"\n' "$(command -v sqlite3)" "$I/sqliterc" >"$I/bin/sqlite3"
+  chmod +x "$I/bin/sqlite3"
+  expect_refused k
+  # And a database with no tables yet is still safe to restore over without --force.
+  mkdir -p "$I/fresh"
+  : >"$I/fresh/openwa.sqlite"
+  guarded_restore "$I/fresh"
+  if [ "$RC" -ne 0 ]; then
+    fail "(k) the rc file made a database with no tables look live"
+  fi
+  pass "(k) with an rc file, a live target is still refused and an empty one still restores"
+else
+  echo "SKIP: (k) sqlite3 not found on this host, so there is no rc file to load"
+fi
+
+echo ""
+echo "==> (l) an unwritable BACKUP_DIR fails before anything is staged"
+# The shipped container mounts its root read-only, so the default ./backups cannot be created. The
+# run must stop up front, not after copying every database and media file into /tmp.
+if [ "$(id -u)" -ne 0 ]; then
+  L="$WORK/l"
+  mkdir -p "$L/data" "$L/ro"
+  make_fixture "$L/data/main.sqlite" "l-main"
+  make_fixture "$L/data/openwa.sqlite" "l-data"
+  chmod a-w "$L/ro"
+  set +e
+  OUT_L="$(cd "$L" && BACKUP_DIR="$L/ro/out" "$BACKUP" 2>&1)"
+  RC_L=$?
+  set -e
+  chmod u+w "$L/ro"
+  if [ "$RC_L" -eq 0 ]; then
+    fail "(l) backup.sh exited 0 with an unwritable BACKUP_DIR"
+  fi
+  if ! printf '%s' "$OUT_L" | grep -q 'BACKUP_DIR=.* is not writable'; then
+    fail "(l) error message does not name the unwritable BACKUP_DIR"
+  fi
+  if printf '%s' "$OUT_L" | grep -q 'Backing up'; then
+    fail "(l) state was staged before the BACKUP_DIR check"
+  fi
+  pass "(l) unwritable BACKUP_DIR -> non-zero exit before staging, clear message"
+else
+  echo "SKIP: (l) running as root, which ignores the permission bits this case relies on"
+fi
+
+echo ""
+echo "==> (m) OPENWA_RESTORE_SNAPSHOT_DIR takes the data-dir snapshot off a read-only parent"
+# The shipped compose file and Helm chart mount the data dir as a volume under a read-only root, so
+# the snapshot's default place next to it cannot be written and the restore stopped there.
+if [ "$(id -u)" -ne 0 ]; then
+  M="$WORK/m"
+  mkdir -p "$M/root/data" "$M/snapshots"
+  printf 'mike-before\n' >"$M/root/data/.api-key"
+  chmod a-w "$M/root"
+  set +e
+  OUT_M="$(cd "$M" && MAIN_DATABASE_NAME="$M/root/data/main.sqlite" DATABASE_NAME="$M/root/data/openwa.sqlite" \
+    OPENWA_DATA_DIR="$M/root/data" OPENWA_RESTORE_SNAPSHOT_DIR="$M/snapshots" "$RESTORE" "$ARCHIVE_H" 2>&1)"
+  RC_M=$?
+  set -e
+  chmod u+w "$M/root"
+  if [ "$RC_M" -ne 0 ]; then
+    fail "(m) restore failed with a writable OPENWA_RESTORE_SNAPSHOT_DIR: $OUT_M"
+  fi
+  if [ "$(cat "$M"/snapshots/data.pre-restore-*/.api-key 2>/dev/null || true)" != "mike-before" ]; then
+    fail "(m) the data-dir snapshot is not under OPENWA_RESTORE_SNAPSHOT_DIR"
+  fi
+  if [ "$(db_fingerprint "$M/root/data/main.sqlite")" != "hotel-archive-main" ]; then
+    fail "(m) the restore did not put the archived main DB in place"
+  fi
+  pass "(m) data-dir snapshot written under OPENWA_RESTORE_SNAPSHOT_DIR, restore completes"
+else
+  echo "SKIP: (m) running as root, which ignores the permission bits this case relies on"
+fi
+
+echo ""
+echo "==> (n) a state dir outside the data dir is snapshotted before any database is written"
+# SESSION_DATA_PATH on its own mount has a parent of its own. When that parent is read-only, the
+# snapshot of the directory cannot go next to it, and a restore that finds out only after writing
+# the databases leaves them from the archive and the sessions from the live install.
+if [ "$(id -u)" -ne 0 ]; then
+  N="$WORK/n"
+  mkdir -p "$N/src/data/sessions/session-s1" "$N/live" "$N/ro/sessions/session-s1" "$N/ext/sessions/session-s1"
+  make_fixture "$N/src/data/main.sqlite" "november-archive-main"
+  make_fixture "$N/src/data/openwa.sqlite" "november-archive-data"
+  printf 'november-archive\n' >"$N/src/data/sessions/session-s1/marker"
+  (
+    cd "$N/src"
+    BACKUP_DIR="$N/out" "$BACKUP" >/dev/null
+  )
+  ARCHIVE_N="$(ls "$N"/out/openwa-backup-*.tar.gz)"
+  make_fixture "$N/live/main.sqlite" "november-live-main"
+  make_fixture "$N/live/openwa.sqlite" "november-live-data"
+  printf 'november-live\n' >"$N/ro/sessions/session-s1/marker"
+  printf 'november-live\n' >"$N/ext/sessions/session-s1/marker"
+
+  # restore_n <sessions dir> [snapshot dir]: a forced restore of ARCHIVE_N over $N/live. Output lands
+  # in OUT, the exit code in RC.
+  restore_n() {
+    set +e
+    OUT="$(cd "$N" && MAIN_DATABASE_NAME="$N/live/main.sqlite" DATABASE_NAME="$N/live/openwa.sqlite" \
+      OPENWA_DATA_DIR="$N/live" SESSION_DATA_PATH="$1" OPENWA_RESTORE_SNAPSHOT_DIR="${2:-}" \
+      "$RESTORE" "$ARCHIVE_N" --force 2>&1)"
+    RC=$?
+    set -e
+  }
+
+  chmod a-w "$N/ro"
+  restore_n "$N/ro/sessions"
+  chmod u+w "$N/ro"
+  if [ "$RC" -eq 0 ]; then
+    fail "(n) restore exited 0 although the sessions snapshot could not be written"
+  fi
+  if [ "$(db_fingerprint "$N/live/main.sqlite")" != "november-live-main" ]; then
+    fail "(n) the main DB was overwritten before the sessions snapshot failed"
+  fi
+  if [ "$(cat "$N/ro/sessions/session-s1/marker")" != "november-live" ]; then
+    fail "(n) the failed restore changed the live sessions"
+  fi
+
+  restore_n "$N/ext/sessions" "$N/snapshots"
+  if [ "$RC" -ne 0 ]; then
+    fail "(n) restore with an external SESSION_DATA_PATH failed: $OUT"
+  fi
+  if [ "$(cat "$N"/snapshots/sessions.pre-restore-*/session-s1/marker 2>/dev/null || true)" != "november-live" ]; then
+    fail "(n) the sessions snapshot is not under OPENWA_RESTORE_SNAPSHOT_DIR"
+  fi
+  if [ -n "$(ls -d "$N"/ext/sessions.pre-restore-* 2>/dev/null || true)" ]; then
+    fail "(n) the sessions snapshot was written next to the target despite OPENWA_RESTORE_SNAPSHOT_DIR"
+  fi
+  if [ "$(cat "$N/ext/sessions/session-s1/marker")" != "november-archive" ]; then
+    fail "(n) the archived sessions were not restored"
+  fi
+  pass "(n) external state snapshotted before the databases are written, under OPENWA_RESTORE_SNAPSHOT_DIR"
+
+  echo ""
+  echo "==> (o) a state dir whose parent is read-only is restored in place"
+  # A volume mounted at /sessions can be emptied but not removed or re-created: its parent is the
+  # read-only root. The unwritable parent stands in for that here.
+  printf 'oscar-stale\n' >"$N/ro/sessions/stale"
+  chmod a-w "$N/ro"
+  restore_n "$N/ro/sessions" "$N/snapshots-o"
+  chmod u+w "$N/ro"
+  if [ "$RC" -ne 0 ]; then
+    fail "(o) restore into a state dir under a read-only parent failed: $OUT"
+  fi
+  if [ "$(cat "$N/ro/sessions/session-s1/marker")" != "november-archive" ]; then
+    fail "(o) the archived sessions were not restored into the directory"
+  fi
+  if [ -e "$N/ro/sessions/stale" ]; then
+    fail "(o) a file the archive does not carry survived the restore"
+  fi
+  if [ "$(cat "$N"/snapshots-o/sessions.pre-restore-*/session-s1/marker 2>/dev/null || true)" != "november-live" ]; then
+    fail "(o) the sessions snapshot is not under OPENWA_RESTORE_SNAPSHOT_DIR"
+  fi
+  pass "(o) a state dir under a read-only parent is emptied and refilled in place"
+else
+  echo "SKIP: (n) and (o) running as root, which ignores the permission bits these cases rely on"
+fi
+
+echo ""
+echo "==> (p) a symlinked database target or data dir is snapshotted as a copy"
+# cp -R copies a symlink as the link itself, and the restore then writes through that link, which
+# would leave a snapshot showing the archive instead of the state it replaced.
+P="$WORK/p"
+mkdir -p "$P/src/data" "$P/real/data"
+make_fixture "$P/src/data/main.sqlite" "papa-archive-main"
+make_fixture "$P/src/data/openwa.sqlite" "papa-archive-data"
+(
+  cd "$P/src"
+  BACKUP_DIR="$P/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_P="$(ls "$P"/out/openwa-backup-*.tar.gz)"
+make_fixture "$P/real/main.sqlite" "papa-live-main"
+make_fixture "$P/real/data/openwa.sqlite" "papa-live-data"
+ln -s "$P/real/main.sqlite" "$P/ext-main.sqlite"
+ln -s "$P/real/data" "$P/live"
+(
+  cd "$P"
+  MAIN_DATABASE_NAME="$P/ext-main.sqlite" DATABASE_NAME="$P/live/openwa.sqlite" OPENWA_DATA_DIR="$P/live" \
+    "$RESTORE" "$ARCHIVE_P" --force >/dev/null
+)
+SNAPSHOT_P="$(ls -d "$P"/ext-main.sqlite.pre-restore-*)"
+if [ -L "$SNAPSHOT_P" ]; then
+  fail "(p) the snapshot of a symlinked database is a link to the file the restore overwrote"
+fi
+if [ "$(db_fingerprint "$SNAPSHOT_P")" != "papa-live-main" ]; then
+  fail "(p) the snapshot does not hold the database the restore replaced"
+fi
+SNAPSHOT_P="$(ls -d "$P"/live.pre-restore-*)"
+if [ -L "$SNAPSHOT_P" ]; then
+  fail "(p) the snapshot of a symlinked data dir is a link to the directory the restore overwrote"
+fi
+if [ "$(db_fingerprint "$SNAPSHOT_P/openwa.sqlite")" != "papa-live-data" ]; then
+  fail "(p) the data-dir snapshot does not hold the data store the restore replaced"
+fi
+if [ "$(db_fingerprint "$P/ext-main.sqlite")" != "papa-archive-main" ]; then
+  fail "(p) the archived main DB was not restored"
+fi
+if [ "$(db_fingerprint "$P/live/openwa.sqlite")" != "papa-archive-data" ]; then
+  fail "(p) the archived data store was not restored"
+fi
+pass "(p) a symlinked database target and data dir are snapshotted as copies"
+
+echo ""
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  echo "==> (q) a leftover -wal is neither replayed over the restored database nor lost from the snapshot"
+  # An unclean stop of a WAL-mode database leaves committed transactions in <db>-wal. SQLite replays
+  # that file over whatever main file sits next to it at the next open, so a restore that copies only
+  # the main file reads back the old install's rows, and a snapshot without it misses those rows.
+  Q="$WORK/q"
+  mkdir -p "$Q/src/data" "$Q/live" "$Q/ext"
+  make_fixture "$Q/src/data/main.sqlite" "quebec-archive-main"
+  make_fixture "$Q/src/data/openwa.sqlite" "quebec-archive-data"
+  (
+    cd "$Q/src"
+    BACKUP_DIR="$Q/out" "$BACKUP" >/dev/null
+  )
+  ARCHIVE_Q="$(ls "$Q"/out/openwa-backup-*.tar.gz)"
+  # wal_fixture <db> <payload>: a WAL-mode database whose main file still says 'stale' and whose
+  # un-checkpointed -wal, as an unclean stop leaves it, says <payload>.
+  wal_fixture() {
+    sqlite3 "$1" "PRAGMA journal_mode=WAL; CREATE TABLE sentinel(payload TEXT); INSERT INTO sentinel VALUES('stale');" >/dev/null
+    cp "$1" "$1.base"
+    sqlite3 "$1" "PRAGMA wal_autocheckpoint=0; UPDATE sentinel SET payload='$2';" ".system cp '$1-wal' '$1.wal'" >/dev/null
+    mv "$1.base" "$1"
+    mv "$1.wal" "$1-wal"
+  }
+  wal_fixture "$Q/live/main.sqlite" "quebec-live-main"
+  wal_fixture "$Q/ext/openwa.sqlite" "quebec-live-data"
+  (
+    cd "$Q"
+    MAIN_DATABASE_NAME="$Q/live/main.sqlite" DATABASE_NAME="$Q/ext/openwa.sqlite" OPENWA_DATA_DIR="$Q/live" \
+      "$RESTORE" "$ARCHIVE_Q" --force >/dev/null
+  )
+  if [ "$(db_fingerprint "$Q/live/main.sqlite")" != "quebec-archive-main" ]; then
+    fail "(q) the old install's -wal was replayed over the restored main DB"
+  fi
+  if [ "$(db_fingerprint "$Q/ext/openwa.sqlite")" != "quebec-archive-data" ]; then
+    fail "(q) the old install's -wal was replayed over the restored data store"
+  fi
+  # The snapshot name ends in the timestamp; its sidecars end in -wal and -shm.
+  if [ "$(db_fingerprint "$(ls -d "$Q"/ext/openwa.sqlite.pre-restore-*[0-9])")" != "quebec-live-data" ]; then
+    fail "(q) the snapshot of a database outside the data dir lost the transactions in its -wal"
+  fi
+  pass "(q) stale -wal files are cleared before the copy and kept in the snapshot"
+else
+  echo "SKIP: (q) sqlite3 not found on this host, so there is no WAL-mode database to build"
+fi
+
+echo ""
+echo "==> (r) a symlinked state dir is archived by content and refilled in place"
+# An operator who keeps media on another disk links ./data/media there. cp -R archived the link and
+# not the files, and the restore replaced the link with a real directory on the data disk, leaving
+# the linked disk with the old files.
+R="$WORK/r"
+mkdir -p "$R/src/data" "$R/src-disk/media" "$R/live" "$R/disk/media"
+make_fixture "$R/src/data/main.sqlite" "romeo-archive-main"
+make_fixture "$R/src/data/openwa.sqlite" "romeo-archive-data"
+printf 'romeo-archive\n' >"$R/src-disk/media/a.jpg"
+ln -s "$R/src-disk/media" "$R/src/data/media"
+(
+  cd "$R/src"
+  BACKUP_DIR="$R/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_R="$(ls "$R"/out/openwa-backup-*.tar.gz)"
+if ! tar -tzf "$ARCHIVE_R" | grep -qx './media/a.jpg'; then
+  fail "(r) backup archived the symlinked media dir as a link instead of its files"
+fi
+printf 'romeo-live\n' >"$R/disk/media/m0"
+ln -s "$R/disk/media" "$R/live/media"
+# restore_r <archive>: a forced restore over $R/live. Output lands in OUT, the exit code in RC.
+restore_r() {
+  set +e
+  OUT="$(cd "$R" && MAIN_DATABASE_NAME="$R/live/main.sqlite" DATABASE_NAME="$R/live/openwa.sqlite" \
+    OPENWA_DATA_DIR="$R/live" "$RESTORE" "$1" --force 2>&1)"
+  RC=$?
+  set -e
+}
+restore_r "$ARCHIVE_R"
+if [ "$RC" -ne 0 ]; then
+  fail "(r) restore over a symlinked media dir failed: $OUT"
+fi
+if [ ! -L "$R/live/media" ]; then
+  fail "(r) the restore replaced the symlinked media dir with a real directory"
+fi
+if [ "$(cat "$R/disk/media/a.jpg" 2>/dev/null || true)" != "romeo-archive" ] || [ -e "$R/disk/media/m0" ]; then
+  fail "(r) the directory the link points at was not refilled with the archived media"
+fi
+if [ "$(cat "$R"/live/media.pre-restore-*/m0 2>/dev/null || true)" != "romeo-live" ]; then
+  fail "(r) the snapshot does not hold the media the restore replaced"
+fi
+# An archive written before backup.sh followed such links carries the link itself, which on this host
+# may point at the very directory being emptied. It is refused before anything is touched.
+mkdir -p "$R/linked"
+tar -xzf "$ARCHIVE_R" -C "$R/linked"
+rm -rf "${R:?}/linked/media"
+ln -s "$R/disk/media" "$R/linked/media"
+tar -czf "$R/linked.tar.gz" -C "$R/linked" .
+rm -f "$R/live/main.sqlite"
+make_fixture "$R/live/main.sqlite" "romeo-live-main"
+restore_r "$R/linked.tar.gz"
+if [ "$RC" -eq 0 ]; then
+  fail "(r) restore accepted an archive whose media member is a symlink"
+fi
+if ! printf '%s' "$OUT" | grep -q 'symlink'; then
+  fail "(r) the refusal does not say the archive member is a symlink"
+fi
+if [ "$(db_fingerprint "$R/live/main.sqlite")" != "romeo-live-main" ] || [ ! -f "$R/disk/media/a.jpg" ]; then
+  fail "(r) the refused restore changed the install"
+fi
+pass "(r) a symlinked media dir is archived by content, refilled through the link, and a linked member is refused"
+
+echo ""
+echo "==> (s) state lands where the restored data/.env.generated points"
+# Dashboard > Infrastructure writes SESSION_DATA_PATH and STORAGE_LOCAL_PATH to data/.env.generated.
+# The restore installs the archive's copy of that file, so the state has to go where it points, not
+# to the defaults a fresh target would otherwise resolve.
+S="$WORK/s"
+mkdir -p "$S/src/data/custom-sessions/session-s1" "$S/src/data/custom-media" "$S/dst" "$S/dst-env"
+make_fixture "$S/src/data/main.sqlite" "sierra-main"
+make_fixture "$S/src/data/openwa.sqlite" "sierra-data"
+printf 'sierra-session\n' >"$S/src/data/custom-sessions/session-s1/marker"
+printf 'sierra-media\n' >"$S/src/data/custom-media/a.jpg"
+printf 'SESSION_DATA_PATH=./data/custom-sessions\nSTORAGE_LOCAL_PATH=./data/custom-media\n' >"$S/src/data/.env.generated"
+(
+  cd "$S/src"
+  BACKUP_DIR="$S/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_S="$(ls "$S"/out/openwa-backup-*.tar.gz)"
+(
+  cd "$S/dst"
+  "$RESTORE" "$ARCHIVE_S" >/dev/null
+)
+if [ "$(cat "$S/dst/data/custom-sessions/session-s1/marker" 2>/dev/null || true)" != "sierra-session" ]; then
+  fail "(s) the sessions did not land at the SESSION_DATA_PATH the restored data/.env.generated names"
+fi
+if [ "$(cat "$S/dst/data/custom-media/a.jpg" 2>/dev/null || true)" != "sierra-media" ]; then
+  fail "(s) the media did not land at the STORAGE_LOCAL_PATH the restored data/.env.generated names"
+fi
+if [ -e "$S/dst/data/sessions" ] || [ -e "$S/dst/data/media" ]; then
+  fail "(s) state was restored to the default paths as well"
+fi
+# ./.env still wins over the restored file, as it does in the app.
+printf 'SESSION_DATA_PATH=./data/env-sessions\n' >"$S/dst-env/.env"
+(
+  cd "$S/dst-env"
+  "$RESTORE" "$ARCHIVE_S" >/dev/null
+)
+if [ "$(cat "$S/dst-env/data/env-sessions/session-s1/marker" 2>/dev/null || true)" != "sierra-session" ]; then
+  fail "(s) a SESSION_DATA_PATH in ./.env lost to the restored data/.env.generated"
+fi
+pass "(s) restored state follows the restored data/.env.generated, and ./.env still wins"
+
+echo ""
+echo "==> (t) ./.env lines with CRLF endings, spaces around = or trailing blanks read as the app reads them"
+# The app loads ./.env with dotenv, which drops a CR, trims the value and accepts `KEY = value`. The
+# scripts kept the CR and the blanks in the path and skipped the spaced line without a word, so a
+# backup fell back to a stale default and a restore wrote `custom.sqlite<CR>` beside the database the
+# app opens, past a live-target guard that probed the wrong name.
+T="$WORK/t"
+mkdir -p "$T/src/data/sess/session-s1" "$T/src/live" "$T/dst/data"
+make_fixture "$T/src/live/auth.sqlite" "tango-main"
+make_fixture "$T/src/live/store.sqlite" "tango-data"
+make_fixture "$T/src/data/main.sqlite" "STALE-main"
+make_fixture "$T/src/data/openwa.sqlite" "STALE-data"
+printf 'tango-session\n' >"$T/src/data/sess/session-s1/marker"
+printf 'MAIN_DATABASE_NAME = %s\r\nDATABASE_NAME=%s\r\nSESSION_DATA_PATH=./data/sess  \r\nBAILEYS_AUTH_DIR: ./data/bl\r\n' \
+  "$T/src/live/auth.sqlite" "$T/src/live/store.sqlite" >"$T/src/.env"
+set +e
+OUT_T="$(cd "$T/src" && BACKUP_DIR="$T/out" "$BACKUP" 2>&1)"
+RC_T=$?
+set -e
+if [ "$RC_T" -ne 0 ]; then
+  fail "(t) backup failed on a CRLF ./.env: $OUT_T"
+fi
+mkdir -p "$T/extract"
+tar -xzf "$(ls "$T"/out/openwa-backup-*.tar.gz)" -C "$T/extract"
+if [ "$(db_fingerprint "$T/extract/main.sqlite")" != "tango-main" ]; then
+  fail "(t) a \`MAIN_DATABASE_NAME = path\` line in ./.env was skipped and the stale default archived"
+fi
+if [ "$(db_fingerprint "$T/extract/openwa.sqlite")" != "tango-data" ]; then
+  fail "(t) a CRLF DATABASE_NAME line in ./.env did not resolve to the database it names"
+fi
+if [ "$(cat "$T/extract/sessions/session-s1/marker" 2>/dev/null || true)" != "tango-session" ]; then
+  fail "(t) a SESSION_DATA_PATH with trailing blanks did not resolve to the sessions dir"
+fi
+if ! printf '%s' "$OUT_T" | grep -q 'sets BAILEYS_AUTH_DIR in a form these scripts do not parse'; then
+  fail "(t) a \`KEY: value\` line was skipped without the warning"
+fi
+printf 'DATABASE_NAME=./data/custom.sqlite\r\nMAIN_DATABASE_NAME = ./data/custom-main.sqlite  \r\n' >"$T/dst/.env"
+make_fixture "$T/dst/data/custom.sqlite" "tango-live"
+set +e
+OUT_T="$(cd "$T/dst" && "$RESTORE" "$(ls "$T"/out/openwa-backup-*.tar.gz)" 2>&1)"
+RC_T=$?
+set -e
+if [ "$RC_T" -eq 0 ]; then
+  fail "(t) restore without --force wrote past the live database a CRLF DATABASE_NAME names"
+fi
+(
+  cd "$T/dst"
+  "$RESTORE" "$(ls "$T"/out/openwa-backup-*.tar.gz)" --force >/dev/null
+)
+if [ "$(db_fingerprint "$T/dst/data/custom.sqlite")" != "tango-data" ]; then
+  fail "(t) restore did not write the data store to the path the CRLF line names"
+fi
+if [ "$(db_fingerprint "$T/dst/data/custom-main.sqlite")" != "tango-main" ]; then
+  fail "(t) restore did not write the main DB to the path the spaced line names"
+fi
+if [ -n "$(find "$T/dst/data" -name "*$(printf '\r')*" 2>/dev/null)" ]; then
+  fail "(t) restore created a file whose name ends in a carriage return"
+fi
+pass "(t) CRLF, spaced and blank-padded ./.env lines resolve like dotenv, and \`KEY: value\` is reported"
+
+echo ""
+echo "==> (u) a target the restore cannot write stops it before any database is written"
+# The snapshot pass skipped a target that did not exist yet and never asked whether one could be
+# written, so the databases were replaced first and the run died on the state directory after them,
+# leaving the archive's databases beside the old sessions, media and configuration.
+if [ "$(id -u)" -ne 0 ]; then
+  U="$WORK/u"
+  mkdir -p "$U/src/data/sessions/session-s1" "$U/live" "$U/ro" "$U/busy/sessions/session-s1"
+  make_fixture "$U/src/data/main.sqlite" "uniform-archive-main"
+  make_fixture "$U/src/data/openwa.sqlite" "uniform-archive-data"
+  printf 'uniform-archive\n' >"$U/src/data/sessions/session-s1/marker"
+  (
+    cd "$U/src"
+    BACKUP_DIR="$U/out" "$BACKUP" >/dev/null
+  )
+  ARCHIVE_U="$(ls "$U"/out/openwa-backup-*.tar.gz)"
+  make_fixture "$U/live/main.sqlite" "uniform-live-main"
+  printf 'uniform-live\n' >"$U/busy/sessions/session-s1/marker"
+
+  # restore_u <sessions dir> <data-store path>: a forced restore of ARCHIVE_U over $U/live. Output
+  # lands in OUT, the exit code in RC.
+  restore_u() {
+    set +e
+    OUT="$(cd "$U" && MAIN_DATABASE_NAME="$U/live/main.sqlite" DATABASE_NAME="$2" OPENWA_DATA_DIR="$U/live" \
+      SESSION_DATA_PATH="$1" OPENWA_RESTORE_SNAPSHOT_DIR="$U/snapshots" "$RESTORE" "$ARCHIVE_U" --force 2>&1)"
+    RC=$?
+    set -e
+  }
+  # expect_untouched <label>: the refused restore must fail, say why, and leave the main DB alone.
+  expect_untouched() {
+    if [ "$RC" -eq 0 ]; then
+      fail "(u) restore exited 0 with an unwritable $1 target"
+    fi
+    if ! printf '%s' "$OUT" | grep -q 'cannot write'; then
+      fail "(u) the refusal for an unwritable $1 target does not say so: $OUT"
+    fi
+    if [ "$(db_fingerprint "$U/live/main.sqlite")" != "uniform-live-main" ]; then
+      fail "(u) the main DB was overwritten before the unwritable $1 target stopped the restore"
+    fi
+  }
+
+  chmod a-w "$U/ro"
+  restore_u "$U/ro/sessions" "$U/live/openwa.sqlite"
+  expect_untouched "missing sessions"
+  restore_u "$U/busy/sessions" "$U/ro/openwa.sqlite"
+  expect_untouched "data store"
+  chmod u+w "$U/ro"
+  # An existing directory is emptied before it is refilled, which needs every directory in it.
+  chmod a-w "$U/busy/sessions/session-s1"
+  restore_u "$U/busy/sessions" "$U/live/openwa.sqlite"
+  chmod u+w "$U/busy/sessions/session-s1"
+  expect_untouched "non-empty sessions"
+  if [ "$(cat "$U/busy/sessions/session-s1/marker")" != "uniform-live" ]; then
+    fail "(u) the refused restore changed the live sessions"
+  fi
+  # The two files written into the data dir after the targets: an archive carrying both, and each one
+  # made read-only in turn.
+  mkdir -p "$U/extra"
+  tar -xzf "$ARCHIVE_U" -C "$U/extra"
+  printf 'LOG_LEVEL=info\n' >"$U/extra/.env.generated"
+  printf -- '-- dump\n' >"$U/extra/database.sql"
+  ARCHIVE_U="$U/extra.tar.gz"
+  tar -czf "$ARCHIVE_U" -C "$U/extra" .
+  for f in .env.generated database.sql; do
+    printf 'uniform-live\n' >"$U/live/$f"
+    chmod a-w "$U/live/$f"
+    restore_u "$U/busy/sessions" "$U/live/openwa.sqlite"
+    chmod u+w "$U/live/$f"
+    rm -f "$U/live/$f"
+    expect_untouched "$f"
+  done
+  pass "(u) an unwritable state or database target stops the restore before anything is written"
+else
+  echo "SKIP: (u) running as root, which ignores the permission bits this case relies on"
+fi
+
+echo ""
+echo "==> (v) a leftover STORAGE_LOCAL_PATH=./uploads follows the app's fallback to ./data/media"
+# v0.2.0 to v0.7.3 persisted ./uploads into data/.env.generated. In the image /app is not writable, so
+# the app cannot create it and keeps media in ./data/media instead; the scripts looked in ./uploads,
+# found nothing and left every media file out without a word. The read-only working directory stands
+# in for /app here.
+if [ "$(id -u)" -ne 0 ]; then
+  V="$WORK/v"
+  mkdir -p "$V/app/data/media" "$V/dst/data" "$V/bare/data"
+  make_fixture "$V/app/data/main.sqlite" "victor-main"
+  make_fixture "$V/app/data/openwa.sqlite" "victor-data"
+  printf 'victor-media\n' >"$V/app/data/media/a.jpg"
+  printf 'STORAGE_LOCAL_PATH=./uploads\n' >"$V/app/data/.env.generated"
+  chmod a-w "$V/app"
+  set +e
+  OUT_V="$(cd "$V/app" && BACKUP_DIR="$V/out" "$BACKUP" 2>&1)"
+  RC_V=$?
+  set -e
+  chmod u+w "$V/app"
+  if [ "$RC_V" -ne 0 ]; then
+    fail "(v) backup failed: $OUT_V"
+  fi
+  ARCHIVE_V="$(ls "$V"/out/openwa-backup-*.tar.gz)"
+  if ! tar -tzf "$ARCHIVE_V" | grep -qx './media/a.jpg'; then
+    fail "(v) backup left out the media the app keeps in ./data/media"
+  fi
+  if ! printf '%s' "$OUT_V" | grep -q 'STORAGE_LOCAL_PATH=./uploads'; then
+    fail "(v) the fallback from the leftover ./uploads was not reported"
+  fi
+  chmod a-w "$V/dst"
+  set +e
+  OUT_V="$(cd "$V/dst" && "$RESTORE" "$ARCHIVE_V" 2>&1)"
+  RC_V=$?
+  set -e
+  chmod u+w "$V/dst"
+  if [ "$RC_V" -ne 0 ]; then
+    fail "(v) restore failed: $OUT_V"
+  fi
+  if [ "$(cat "$V/dst/data/media/a.jpg" 2>/dev/null || true)" != "victor-media" ]; then
+    fail "(v) restore did not put the media back where the app reads it"
+  fi
+  # On a host where ./uploads can be created the app uses it, so the scripts keep it too, and a
+  # media dir that is not there is reported rather than skipped in silence.
+  make_fixture "$V/bare/data/main.sqlite" "victor-bare-main"
+  make_fixture "$V/bare/data/openwa.sqlite" "victor-bare-data"
+  printf 'STORAGE_LOCAL_PATH=./uploads\n' >"$V/bare/data/.env.generated"
+  OUT_V="$(cd "$V/bare" && BACKUP_DIR="$V/out-bare" "$BACKUP" 2>&1)"
+  if ! printf '%s' "$OUT_V" | grep -q 'WARN: ./uploads not found'; then
+    fail "(v) a missing media dir was skipped without a warning"
+  fi
+  pass "(v) a leftover ./uploads falls back like the app, and missing media is reported"
+else
+  echo "SKIP: (v) running as root, which ignores the permission bits this case relies on"
+fi
+
+echo ""
+echo "==> (w) the default colocated plugins dir is rebuilt from both archive members"
+# Every default and Docker install keeps plugin packages and plugin state in one ./data/plugins, which
+# restore replaces once from a merge of the two members. An archive from a split layout makes the
+# members differ, so a merge that is skipped or a half that replaces the other shows up here.
+W="$WORK/w"
+mkdir -p "$W/split/data" "$W/split/pkgs/pkg-a" "$W/split/state/plugins/chatwoot" "$W/dst/data/plugins/old"
+make_fixture "$W/split/data/main.sqlite" "whiskey-main"
+make_fixture "$W/split/data/openwa.sqlite" "whiskey-data"
+printf 'whiskey-code\n' >"$W/split/pkgs/pkg-a/index.js"
+printf '{"plugins":[{"id":"chatwoot"}]}' >"$W/split/state/plugins/registry.json"
+printf 'whiskey-state\n' >"$W/split/state/plugins/chatwoot/k.json"
+printf 'whiskey-stale\n' >"$W/dst/data/plugins/old/x"
+(
+  cd "$W/split"
+  PLUGINS_DIR="$W/split/pkgs" PLUGIN_STATE_DIR="$W/split/state" BACKUP_DIR="$W/out" "$BACKUP" >/dev/null
+)
+(
+  cd "$W/dst"
+  "$RESTORE" "$(ls "$W"/out/openwa-backup-*.tar.gz)" >/dev/null
+)
+# check_plugins <dir> <label>: the package, the registry and the plugin's storage all landed in <dir>.
+check_plugins() {
+  if [ "$(cat "$1/pkg-a/index.js" 2>/dev/null || true)" != "whiskey-code" ]; then
+    fail "(w) $2: the installed plugin package is missing from the colocated plugins dir"
+  fi
+  if [ ! -f "$1/registry.json" ]; then
+    fail "(w) $2: the plugin registry is missing from the colocated plugins dir"
+  fi
+  if [ "$(cat "$1/chatwoot/k.json" 2>/dev/null || true)" != "whiskey-state" ]; then
+    fail "(w) $2: a plugin's persisted ctx.storage is missing from the colocated plugins dir"
+  fi
+}
+check_plugins "$W/dst/data/plugins" "split archive"
+if [ -e "$W/dst/data/plugins/old/x" ]; then
+  fail "(w) a plugin entry the archive does not carry survived the restore"
+fi
+if [ "$(cat "$W"/dst/data.pre-restore-*/plugins/old/x 2>/dev/null || true)" != "whiskey-stale" ]; then
+  fail "(w) the data-dir snapshot does not hold the plugins dir the restore replaced"
+fi
+# And the plain round trip of that default layout keeps all three.
+(
+  cd "$W/dst"
+  BACKUP_DIR="$W/out-default" "$BACKUP" >/dev/null
+)
+mkdir -p "$W/dst2"
+(
+  cd "$W/dst2"
+  "$RESTORE" "$(ls "$W"/out-default/openwa-backup-*.tar.gz)" >/dev/null
+)
+check_plugins "$W/dst2/data/plugins" "default round trip"
+pass "(w) the colocated plugins dir gets packages and state, and loses what the archive does not carry"
+
+echo ""
+echo "==> (x) a BOOTSTRAP_KEY_FILE outside the data dir is archived and restored there"
+# The app writes and reads the generated admin key at BOOTSTRAP_KEY_FILE. The scripts only looked at
+# <data dir>/.api-key, so a relocated key was left out of the archive without a word, and an archived
+# one went back to a path the app never reads.
+X="$WORK/x"
+mkdir -p "$X/src/data" "$X/src/secrets" "$X/dst" "$X/ro/data"
+make_fixture "$X/src/data/main.sqlite" "xray-main"
+make_fixture "$X/src/data/openwa.sqlite" "xray-data"
+printf 'xray-key\n' >"$X/src/secrets/admin.key"
+printf 'BOOTSTRAP_KEY_FILE=%s\n' "$X/src/secrets/admin.key" >"$X/src/.env"
+(
+  cd "$X/src"
+  BACKUP_DIR="$X/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_X="$(ls "$X"/out/openwa-backup-*.tar.gz)"
+if [ "$(tar -xOzf "$ARCHIVE_X" ./.api-key 2>/dev/null || true)" != "xray-key" ]; then
+  fail "(x) backup left out the admin key BOOTSTRAP_KEY_FILE names"
+fi
+(
+  cd "$X/dst"
+  BOOTSTRAP_KEY_FILE="$X/dst/secrets/admin.key" "$RESTORE" "$ARCHIVE_X" >/dev/null
+)
+if [ "$(cat "$X/dst/secrets/admin.key" 2>/dev/null || true)" != "xray-key" ]; then
+  fail "(x) restore did not put the admin key where BOOTSTRAP_KEY_FILE points"
+fi
+if [ -e "$X/dst/data/.api-key" ]; then
+  fail "(x) restore also wrote the admin key to the data dir, where the app does not read it"
+fi
+if [ "$(id -u)" -ne 0 ]; then
+  # A key path the restore cannot write is refused with the other targets, before any database.
+  make_fixture "$X/ro/data/main.sqlite" "xray-live-main"
+  mkdir -p "$X/ro/secrets"
+  chmod a-w "$X/ro/secrets"
+  set +e
+  OUT_X="$(cd "$X/ro" && BOOTSTRAP_KEY_FILE="$X/ro/secrets/admin.key" "$RESTORE" "$ARCHIVE_X" --force 2>&1)"
+  RC_X=$?
+  set -e
+  chmod u+w "$X/ro/secrets"
+  if [ "$RC_X" -eq 0 ] || ! printf '%s' "$OUT_X" | grep -q 'cannot write'; then
+    fail "(x) an unwritable BOOTSTRAP_KEY_FILE was not refused: $OUT_X"
+  fi
+  if [ "$(db_fingerprint "$X/ro/data/main.sqlite")" != "xray-live-main" ]; then
+    fail "(x) the main DB was overwritten before the unwritable key path stopped the restore"
+  fi
+fi
+pass "(x) BOOTSTRAP_KEY_FILE is honoured by backup and by restore"
+
+echo ""
+echo "==> (y) plugin code in the legacy ./plugins is reported, since the archive does not carry it"
+# With PLUGINS_DIR unset the app still loads packages from ./plugins, the default up to 0.12.1, but
+# the archive holds only <data dir>/plugins, so a restore brings back a registry with no code.
+Y="$WORK/y"
+mkdir -p "$Y/data" "$Y/plugins/legacy-bot"
+make_fixture "$Y/data/main.sqlite" "yankee-main"
+make_fixture "$Y/data/openwa.sqlite" "yankee-data"
+printf '{"id":"legacy-bot"}' >"$Y/plugins/legacy-bot/manifest.json"
+OUT_Y="$(cd "$Y" && BACKUP_DIR="$Y/out" "$BACKUP" 2>&1)"
+if ! printf '%s' "$OUT_Y" | grep -q 'WARN: ./plugins holds plugin packages'; then
+  fail "(y) plugin code in the legacy ./plugins was left out without a warning"
+fi
+OUT_Y="$(cd "$Y" && PLUGINS_DIR="$Y/plugins" BACKUP_DIR="$Y/out2" "$BACKUP" 2>&1)"
+if printf '%s' "$OUT_Y" | grep -q 'WARN: ./plugins'; then
+  fail "(y) the legacy ./plugins was reported although PLUGINS_DIR names the plugin dir"
+fi
+pass "(y) packages in the legacy ./plugins are reported when PLUGINS_DIR is unset"
+
+echo ""
+echo "==> (z) a leftover ./uploads that was never created follows the app to an existing ./data/media"
+# docker exec runs the scripts as root, which can create /app/uploads, while the app runs as openwa,
+# which cannot and keeps media in ./data/media. Deciding by writability alone archived no media there
+# and restored it into the container layer. The app creates a ./uploads it uses at boot, so a missing
+# ./uploads beside an existing ./data/media means ./data/media is the one in use, whatever the uid.
+Z="$WORK/z"
+mkdir -p "$Z/app/data/media" "$Z/dst/data/media"
+make_fixture "$Z/app/data/main.sqlite" "zulu-main"
+make_fixture "$Z/app/data/openwa.sqlite" "zulu-data"
+printf 'zulu-media\n' >"$Z/app/data/media/a.jpg"
+printf 'STORAGE_LOCAL_PATH=./uploads\n' >"$Z/app/data/.env.generated"
+OUT_Z="$(cd "$Z/app" && BACKUP_DIR="$Z/out" "$BACKUP" 2>&1)"
+ARCHIVE_Z="$(ls "$Z"/out/openwa-backup-*.tar.gz)"
+if ! tar -tzf "$ARCHIVE_Z" | grep -qx './media/a.jpg'; then
+  fail "(z) backup left out the media in ./data/media: $OUT_Z"
+fi
+OUT_Z="$(cd "$Z/dst" && "$RESTORE" "$ARCHIVE_Z" 2>&1)"
+if [ "$(cat "$Z/dst/data/media/a.jpg" 2>/dev/null || true)" != "zulu-media" ] || [ -e "$Z/dst/uploads" ]; then
+  fail "(z) restore did not put the media back under ./data/media: $OUT_Z"
+fi
+pass "(z) a never-created ./uploads beside ./data/media resolves to ./data/media without a uid check"
+
+echo ""
+echo "==> (aa) engine auth state copied from a running app is noted, and restore does not refuse it"
+# The databases are snapshotted consistently online, but sessions/ and baileys/ are plain copies of
+# directories the engines keep writing, and the runbook called the online backup impact-free. The
+# note has its own marker: --strict gates only the database one, or it would refuse every online backup.
+AA="$WORK/aa"
+mkdir -p "$AA/src/data/sessions/session-s1" "$AA/src/data/sessions/session-s2" "$AA/src/data/baileys/s1" \
+  "$AA/dst" "$AA/quiet/data/sessions/session-s1"
+make_fixture "$AA/src/data/main.sqlite" "alpha2-main"
+make_fixture "$AA/src/data/openwa.sqlite" "alpha2-data"
+printf 'profile\n' >"$AA/src/data/sessions/session-s1/Preferences"
+printf 'profile\n' >"$AA/src/data/sessions/session-s2/Preferences"
+ln -s host-123 "$AA/src/data/sessions/session-s1/SingletonLock"
+printf '{}' >"$AA/src/data/baileys/s1/creds.json"
+OUT_AA="$(cd "$AA/src" && BACKUP_DIR="$AA/out" "$BACKUP" 2>&1)"
+ARCHIVE_AA="$(ls "$AA"/out/openwa-backup-*.tar.gz)"
+NOTE_AA="$(tar -xOzf "$ARCHIVE_AA" ./ENGINE-STATE-NOTE 2>/dev/null || true)"
+if ! printf '%s\n' "$NOTE_AA" | grep -q 'open or left by a killed browser: session-s1)' ||
+  ! printf '%s\n' "$NOTE_AA" | grep -q '^baileys/'; then
+  fail "(aa) the archive does not note the open profile and the Baileys state: $NOTE_AA"
+fi
+# Without sqlite3 the same archive carries CONSISTENCY-WARNING, so the engine note must not vouch
+# for the databases.
+if printf '%s\n' "$NOTE_AA" | grep -qi 'consistent snapshot'; then
+  fail "(aa) the engine note claims the databases are consistent: $NOTE_AA"
+fi
+if ! printf '%s' "$OUT_AA" | grep -q 'may have been written during the copy'; then
+  fail "(aa) backup did not warn that engine auth state may have been written during the copy: $OUT_AA"
+fi
+if ! tar -tvzf "$ARCHIVE_AA" | grep -q '^l.*session-s1/SingletonLock'; then
+  fail "(aa) the profile lock was not archived as the symlink it is"
+fi
+# Without sqlite3 the databases are plain-copied and --strict rightly refuses on that marker.
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  OUT_AA="$(cd "$AA/dst" && "$RESTORE" "$ARCHIVE_AA" --strict 2>&1)" ||
+    fail "(aa) restore --strict refused an archive whose only note is the engine one: $OUT_AA"
+else
+  OUT_AA="$(cd "$AA/dst" && "$RESTORE" "$ARCHIVE_AA" 2>&1)" || fail "(aa) restore failed: $OUT_AA"
+fi
+if ! printf '%s' "$OUT_AA" | grep -q 'ENGINE-STATE-NOTE; engine auth state may have been copied' ||
+  ! printf '%s' "$OUT_AA" | grep -q 'session-s1'; then
+  fail "(aa) restore did not print the engine state note: $OUT_AA"
+fi
+# No open profile and no Baileys state: nothing to note.
+make_fixture "$AA/quiet/data/main.sqlite" "alpha2-quiet-main"
+make_fixture "$AA/quiet/data/openwa.sqlite" "alpha2-quiet-data"
+printf 'profile\n' >"$AA/quiet/data/sessions/session-s1/Preferences"
+(cd "$AA/quiet" && BACKUP_DIR="$AA/quiet-out" "$BACKUP" >/dev/null 2>&1)
+if tar -tzf "$(ls "$AA"/quiet-out/openwa-backup-*.tar.gz)" | grep -q 'ENGINE-STATE-NOTE'; then
+  fail "(aa) an archive with no open profile and no Baileys state carries the engine note"
+fi
+pass "(aa) live engine auth state is noted in the archive and printed, never refused"
+
+echo ""
+echo "==> (ab) a blank line in ./.env hides the key from data/.env.generated, as it does in the app"
+# dotenv sets a blank ./.env line to '' and never overwrites a key that is already set, so the app
+# reads its built-in default and never sees .env.generated's value. Falling through to that value
+# archived a database the app does not use, and the run exited 0.
+AB="$WORK/ab"
+mkdir -p "$AB/data" "$AB/elsewhere" "$AB/extract"
+make_fixture "$AB/data/main.sqlite" "bravo2-main"
+make_fixture "$AB/data/openwa.sqlite" "bravo2-default"
+make_fixture "$AB/elsewhere/openwa.sqlite" "WRONG-data"
+printf 'DATABASE_NAME=\n' >"$AB/.env"
+printf 'DATABASE_NAME=%s\n' "$AB/elsewhere/openwa.sqlite" >"$AB/data/.env.generated"
+(cd "$AB" && BACKUP_DIR="$AB/out" "$BACKUP" >/dev/null 2>&1)
+tar -xzf "$(ls "$AB"/out/openwa-backup-*.tar.gz)" -C "$AB/extract"
+if [ "$(db_fingerprint "$AB/extract/openwa.sqlite")" != "bravo2-default" ]; then
+  fail "(ab) a blank DATABASE_NAME in ./.env fell through to data/.env.generated"
+fi
+pass "(ab) a blank ./.env line stops the lookup and the built-in default applies"
+
+echo ""
+echo "==> (ac) a Baileys engine chosen in the dashboard is warned about when its auth dir is missing"
+# Compose forwards a blank ENGINE_TYPE and the dashboard saves the real one in data/.env.generated, so
+# reading the environment alone never saw Baileys there and skipped the re-pairing warning.
+AC="$WORK/ac"
+mkdir -p "$AC/data"
+make_fixture "$AC/data/main.sqlite" "charlie2-main"
+make_fixture "$AC/data/openwa.sqlite" "charlie2-data"
+printf 'ENGINE_TYPE=baileys\n' >"$AC/data/.env.generated"
+OUT_AC="$(cd "$AC" && ENGINE_TYPE='' BACKUP_DIR="$AC/out" "$BACKUP" 2>&1)"
+if ! printf '%s' "$OUT_AC" | grep -q 'ENGINE_TYPE=baileys but .* was not found'; then
+  fail "(ac) a dashboard-selected Baileys engine with no auth dir was not reported: $OUT_AC"
+fi
+pass "(ac) the missing Baileys auth dir is reported when data/.env.generated selects Baileys"
+
+echo ""
+echo "==> (ad) a file the engine deletes during the state copy notes the copy instead of failing the backup"
+# Chromium and the Baileys auth store delete and rename files while they run, so cp can list a file
+# that is gone when it opens it. Under set -e that aborted the online backup with no archive. The shim
+# cp copies for real, then reports the error a vanished file gives; any other cp error stays fatal.
+AD="$WORK/ad"
+mkdir -p "$AD/data/sessions/session-s1" "$AD/data/baileys/s1" "$AD/data/media" "$AD/data/plugins" "$AD/shim"
+make_fixture "$AD/data/main.sqlite" "delta2-main"
+make_fixture "$AD/data/openwa.sqlite" "delta2-data"
+printf 'profile\n' >"$AD/data/sessions/session-s1/Preferences"
+printf '{}' >"$AD/data/baileys/s1/creds.json"
+printf 'jpeg\n' >"$AD/data/media/status.jpg"
+printf '{}' >"$AD/data/plugins/registry.json"
+# SHIM_CP_LINES repeats the error past a pipe buffer, the size of a real tree's worth of failures. Without
+# LC_ALL=C the vanished-file text comes out translated, as cp prints it on a localized host.
+cat >"$AD/shim/cp" <<SHIM
+#!/bin/sh
+$(command -v cp) "\$@" || exit
+msg="\$SHIM_CP_ERROR"
+if [ "\${LC_ALL:-}" != C ] && [ "\$msg" = 'No such file or directory' ]; then
+  msg='Datei oder Verzeichnis nicht gefunden'
+fi
+case "\$3" in
+  */sessions | */baileys | */media | */plugin-*)
+    i=0
+    while [ "\$i" -lt "\${SHIM_CP_LINES:-1}" ]; do
+      echo "cp: cannot stat '\$2/gone\$i': \$msg" >&2
+      i=\$((i + 1))
+    done
+    exit 1
+    ;;
+esac
+SHIM
+chmod +x "$AD/shim/cp"
+set +e
+OUT_AD="$(cd "$AD" && SHIM_CP_ERROR='No such file or directory' PATH="$AD/shim:$PATH" BACKUP_DIR="$AD/out" "$BACKUP" 2>&1)"
+RC_AD=$?
+set -e
+if [ "$RC_AD" -ne 0 ]; then
+  fail "(ad) a file that vanished during the engine state copy failed the backup: $OUT_AD"
+fi
+NOTE_AD="$(tar -xOzf "$(ls "$AD"/out/openwa-backup-*.tar.gz)" ./ENGINE-STATE-NOTE 2>/dev/null || true)"
+if ! printf '%s\n' "$NOTE_AD" | grep -q '^sessions/ (files changed during the copy)' ||
+  ! printf '%s\n' "$NOTE_AD" | grep -q '^baileys/ (files changed during the copy)'; then
+  fail "(ad) the archive does not note the state copies that changed underneath: $NOTE_AD"
+fi
+for tree in media plugins; do
+  if ! printf '%s\n' "$OUT_AD" | grep -q "WARN: files under .*/$tree changed during the copy"; then
+    fail "(ad) the backup did not log the $tree copy that changed underneath: $OUT_AD"
+  fi
+done
+set +e
+OUT_AD="$(cd "$AD" && SHIM_CP_ERROR='Permission denied' SHIM_CP_LINES=20000 PATH="$AD/shim:$PATH" \
+  BACKUP_DIR="$AD/out2" "$BACKUP" 2>&1)"
+RC_AD=$?
+set -e
+if [ "$RC_AD" -eq 0 ] || ! grep -q 'Permission denied' <<<"$OUT_AD" ||
+  [ -n "$(ls "$AD"/out2/openwa-backup-*.tar.gz 2>/dev/null)" ]; then
+  fail "(ad) a cp error other than a vanished file did not fail the backup: $(tail -n 5 <<<"$OUT_AD")"
+fi
+pass "(ad) a vanished engine file is noted, a vanished media or plugin file logged, other cp errors fatal"
+
+echo ""
+echo "==> (ae) the min-content check passes an archive whose listing outgrows a pipe buffer"
+# A whatsapp-web.js profile alone lists thousands of members. A grep -q that matched a required member
+# early and stopped reading broke the pipe feeding it, and pipefail turned the match into "missing", so a
+# good archive was deleted. The shim tar pads the listing after the real members, past a pipe buffer.
+AE="$WORK/ae"
+mkdir -p "$AE/data" "$AE/shim"
+make_fixture "$AE/data/main.sqlite" "echo2-main"
+make_fixture "$AE/data/openwa.sqlite" "echo2-data"
+cat >"$AE/shim/tar" <<SHIM
+#!/bin/sh
+$(command -v tar) "\$@" || exit
+if [ "\$1" = -tzf ]; then
+  i=0
+  while [ "\$i" -lt 20000 ]; do
+    echo "./sessions/session-s1/Default/Cache/Cache_Data/padding-\$i"
+    i=\$((i + 1))
+  done
+fi
+SHIM
+chmod +x "$AE/shim/tar"
+set +e
+OUT_AE="$(cd "$AE" && PATH="$AE/shim:$PATH" BACKUP_DIR="$AE/out" "$BACKUP" 2>&1)"
+RC_AE=$?
+set -e
+if [ "$RC_AE" -ne 0 ] || [ -z "$(ls "$AE"/out/openwa-backup-*.tar.gz 2>/dev/null)" ]; then
+  fail "(ae) a long archive listing failed the min-content check: $(grep -v padding- <<<"$OUT_AE")"
+fi
+pass "(ae) the min-content check reads the whole listing"
+
+echo ""
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  echo "==> (af) the online SQLite backup waits out a writer holding the database lock"
+  # The app writes several times a second in rollback-journal mode. A bare .backup gave up on the first
+  # lock it met with 'database is locked', so on a busy gateway no online backup completed.
+  AF="$WORK/af"
+  mkdir -p "$AF/data"
+  make_fixture "$AF/data/main.sqlite" "foxtrot2-main"
+  make_fixture "$AF/data/openwa.sqlite" "foxtrot2-data"
+  {
+    echo 'BEGIN EXCLUSIVE;'
+    echo "INSERT INTO sentinel VALUES('foxtrot2-late');"
+    echo ".system touch '$AF/locked'"
+    sleep 2
+    echo 'COMMIT;'
+  } | sqlite3 "$AF/data/main.sqlite" &
+  WRITER_AF=$!
+  for _ in $(seq 1 100); do
+    [ -f "$AF/locked" ] && break
+    sleep 0.1
+  done
+  [ -f "$AF/locked" ] || fail "(af) the writer never took the database lock"
+  set +e
+  OUT_AF="$(cd "$AF" && BACKUP_DIR="$AF/out" "$BACKUP" 2>&1)"
+  RC_AF=$?
+  set -e
+  wait "$WRITER_AF"
+  if [ "$RC_AF" -ne 0 ]; then
+    fail "(af) the backup failed while a writer held the database lock: $OUT_AF"
+  fi
+  mkdir -p "$AF/extract"
+  tar -xzf "$(ls "$AF"/out/openwa-backup-*.tar.gz)" -C "$AF/extract"
+  if [ "$(sqlite3 "$AF/extract/main.sqlite" 'PRAGMA integrity_check;')" != ok ]; then
+    fail "(af) the snapshot taken after the writer let go is not a sound database"
+  fi
+  pass "(af) the online backup waits for the lock instead of failing"
+else
+  echo "SKIP: (af) sqlite3 not found on this host, so there is no database lock to wait on"
+fi
+
+echo ""
+echo "==> (ag) quoted, commented and empty-quoted ./.env values resolve as the app reads them"
+# dotenv strips a value's quotes and an unquoted value's comment, and a key it has set keeps
+# data/.env.generated from supplying it. The scripts skipped every such line and read the next layer,
+# so .env.example's commented PLUGINS_DIR line and a `DATABASE_NAME=""` resolved to values the app
+# never uses.
+AG="$WORK/ag"
+mkdir -p "$AG/data"
+cat >"$AG/.env" <<'ENV'
+PLUGINS_DIR=./data/plugins          # Plugin directory (default: ./data/plugins)
+DATABASE_NAME=""
+MAIN_DATABASE_NAME='./data/quoted main.sqlite'
+BAILEYS_AUTH_DIR=./data/bl#inline
+SESSION_DATA_PATH="./data/sess" # quoted, then a comment
+STORAGE_LOCAL_PATH="./data/media" # see "docs"
+PLUGIN_STATE_DIR='./data/state' # it'
+ENV
+printf 'DATABASE_NAME=./elsewhere/openwa.sqlite\nSESSION_DATA_PATH=./elsewhere/sess\n' >"$AG/data/.env.generated"
+resolve_ag() {
+  (cd "$AG" && DATA_DIR=./data && . "$REPO_ROOT/scripts/lib-env.sh" && openwa_resolve "$1" "$2") 2>>"$AG/err"
+}
+# A blank value and an unparsed line both resolve to the default, never to data/.env.generated.
+for check in 'PLUGINS_DIR|./data/plugins' 'DATABASE_NAME|DEFAULT' 'MAIN_DATABASE_NAME|./data/quoted main.sqlite' \
+  'BAILEYS_AUTH_DIR|./data/bl' 'SESSION_DATA_PATH|DEFAULT' 'STORAGE_LOCAL_PATH|DEFAULT' 'PLUGIN_STATE_DIR|DEFAULT'; do
+  key="${check%%|*}"
+  got="$(resolve_ag "$key" DEFAULT)"
+  if [ "$got" != "${check#*|}" ]; then
+    fail "(ag) $key resolved to '$got', expected '${check#*|}'"
+  fi
+done
+# A comment ending in the value's own quote must not pass for the closing quote.
+if [ "$(grep -c 'do not parse' "$AG/err")" -ne 3 ] || ! grep -q 'sets SESSION_DATA_PATH in a form' "$AG/err" ||
+  ! grep -q 'sets STORAGE_LOCAL_PATH in a form' "$AG/err" || ! grep -q 'sets PLUGIN_STATE_DIR in a form' "$AG/err"; then
+  fail "(ag) the parse warning did not name exactly the three unparsed lines: $(cat "$AG/err")"
+fi
+pass "(ag) dotenv's quoted, commented and empty forms resolve like the app, and an unparsed line stops the lookup"
+
+echo ""
+echo "All smoke tests passed!"

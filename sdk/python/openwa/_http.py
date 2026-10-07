@@ -1,0 +1,165 @@
+"""HTTP transport wrapper for the OpenWA Python SDK.
+
+The client never builds a bare :class:`httpx.Client` with a hard-coded
+transport. Instead it accepts an optional ``transport`` (an ``httpx.BaseTransport``)
+that overrides the default. This makes the SDK trivially testable — a test
+passes ``httpx.MockTransport(handler)`` instead of monkey-patching — and lets
+consumers intercept/observability-wrap outbound calls.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping
+from urllib.parse import quote
+
+import httpx
+
+from .errors import OpenWAApiError, OpenWATimeoutError, classify
+
+HttpMethod = str  # "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+
+
+def quote_segment(segment: Any) -> str:
+    """Percent-encode a single path segment so a value containing ``/``, ``#`` or
+    ``?`` can't break out of its path position. WhatsApp-id characters that are
+    already path-safe (``@``, ``:``, ``+``) are kept readable.
+
+    Raises :class:`ValueError` for an empty, ``.`` or ``..`` segment: httpx
+    resolves dot segments before sending, so such an id would reach the
+    parent resource instead of the intended one.
+    """
+    text = str(segment)
+    if text in ("", ".", ".."):
+        raise ValueError(f"OpenWA: empty or dot path segment {text!r}")
+    return quote(text, safe="@:+")
+
+
+def build_url(base_url: str, path: str, query: Mapping[str, Any] | None = None) -> str:
+    """Build a URL, serializing query params and skipping ``None`` values.
+
+    Raises :class:`ValueError` for a path that does not begin with ``/``, as the
+    JavaScript, Go and Java clients do: an absolute URL such as
+    ``https://example.net/x`` would replace the client's base host and carry the
+    API key there.
+    """
+    if not path.startswith("/"):
+        raise ValueError(f"OpenWA: path must begin with '/': {path!r}")
+    url = f"{base_url.rstrip('/')}{path}"
+    if not query:
+        return url
+
+    def _serialize(v: Any) -> str:
+        # Booleans must be lowercase: the backend reads query flags as `=== 'true'`,
+        # so Python's default str(True) == 'True' would be silently ignored.
+        if v is True:
+            return "true"
+        if v is False:
+            return "false"
+        return str(v)
+
+    params = {k: _serialize(v) for k, v in query.items() if v is not None}
+    if not params:
+        return url
+    # Merge rather than pass params= to httpx.Request, which replaces a query already in the path.
+    return str(httpx.URL(url).copy_merge_params(params))
+
+
+class HttpExecutor:
+    """Owns the :class:`httpx.Client` and performs JSON requests.
+
+    Constructed once per :class:`OpenWAClient`; the transport is taken from
+    the client config so all requests share one connection pool.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout: float = 30.0,
+        default_headers: Mapping[str, str] | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        # Caller-supplied default headers are applied FIRST so the auth/JSON
+        # headers below always win and can never be clobbered (mirrors the JS SDK).
+        # httpx.Headers matches names case-insensitively, so a lowercase copy is
+        # replaced instead of being sent alongside ours.
+        headers = httpx.Headers(default_headers)
+        headers["Content-Type"] = "application/json"
+        headers["X-API-Key"] = api_key
+        client_kwargs: dict[str, Any] = {
+            "base_url": base_url.rstrip("/"),
+            "headers": headers,
+            "timeout": timeout,
+            # Never auto-follow redirects: doing so would re-send the X-API-Key
+            # header to the redirect target (potentially a different origin).
+            # (This is also httpx's default; set explicitly so it can't regress.)
+            "follow_redirects": False,
+        }
+        if transport is not None:
+            client_kwargs["transport"] = transport
+        self._client = httpx.Client(**client_kwargs)
+        self._timeout = timeout
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "HttpExecutor":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def request(
+        self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None = None,
+        body: Any = None, idempotency_key: str | None = None
+    ) -> Any:
+        """Perform one request and return the parsed JSON (or ``None`` for 204)."""
+        res = self._send(method, path, query=query, body=body, idempotency_key=idempotency_key)
+        if res.status_code == 204 or not res.content:
+            return None
+        try:
+            return res.json()
+        except ValueError:
+            # A 2xx body that isn't JSON surfaces as text rather than a raw
+            # JSONDecodeError (mirrors the JS and PHP transports).
+            return res.text
+
+    def request_bytes(
+        self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None = None
+    ) -> tuple[bytes, str | None]:
+        """Perform one request for a non-JSON (binary) 2xx body — e.g. stored
+        status media — and return ``(body bytes, content type)``. A 204 yields
+        empty bytes and ``None``; any other empty 2xx body yields empty bytes
+        and the served content type."""
+        res = self._send(method, path, query=query, body=None)
+        if res.status_code == 204:
+            return b"", None
+        return res.content, res.headers.get("content-type")
+
+    def _send(
+        self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None,
+        body: Any, idempotency_key: str | None = None
+    ) -> httpx.Response:
+        """Shared transport for :meth:`request` and :meth:`request_bytes`: builds
+        the URL, performs the request, and translates a non-2xx into a typed error."""
+        headers = None
+        if idempotency_key is not None:
+            if (
+                not isinstance(idempotency_key, str)
+                or not 1 <= len(idempotency_key) <= 255
+                or any(not "!" <= char <= "~" for char in idempotency_key)
+            ):
+                raise ValueError("Idempotency-Key must contain 1-255 visible ASCII characters")
+            headers = {"Idempotency-Key": idempotency_key}
+        url = build_url("", path, query)
+        try:
+            res = self._client.request(method, url, json=body if body is not None else None, headers=headers)
+        except httpx.TimeoutException as e:
+            raise OpenWATimeoutError(self._timeout) from e
+        # Treat any non-2xx as an error, including 3xx: redirects are deliberately not followed
+        # (so the API key is never re-sent to the target), which makes an unfollowed 3xx unusable
+        # rather than a success. Matches the JS transport's `!res.ok`.
+        if res.status_code >= 300:
+            context = f"{method} {path}"
+            raise OpenWAApiError.from_response(res.status_code, res.text, context, headers=res.headers)
+        return res
