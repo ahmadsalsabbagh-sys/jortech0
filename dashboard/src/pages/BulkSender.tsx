@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Send, Clock, Users, Play, AlertCircle, CheckCircle2, XCircle, FileText, Upload, Activity, Rocket, MessageSquare, Settings, Monitor, Phone, HelpCircle, X, Plus } from 'lucide-react';
+import { Clock, Users, AlertCircle, CheckCircle2, XCircle, FileText, Upload, Activity, Rocket, MessageSquare, Settings, Monitor, Phone, HelpCircle, X, Plus } from 'lucide-react';
 import { sessionApi, messageApi, type Session } from '../services/api';
 import { PageHeader } from '../components/PageHeader';
 import * as XLSX from 'xlsx';

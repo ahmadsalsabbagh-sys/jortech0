@@ -17,8 +17,6 @@ import {
   Puzzle,
   Sun,
   Moon,
-  Monitor,
-  Menu,
   X,
   Languages,
   Grid
@@ -29,7 +27,7 @@ import { resolveSupportedLanguage } from '../i18n';
 import type { UserRole } from '../types/role';
 import './Layout.css';
 
-export function Layout({ onLogout, userRole }: { onLogout: () => void; userRole: UserRole | null }) {
+export function Layout({ onLogout }: { onLogout: () => void; userRole: UserRole | null }) {
   const { t, i18n } = useTranslation();
   const { theme, toggleTheme } = useTheme();
   const { isAdmin, scoped } = useRole();

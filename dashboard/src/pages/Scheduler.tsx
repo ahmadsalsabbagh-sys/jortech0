@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Calendar, Clock, Send, Trash2, Zap, AlertCircle, CheckCircle2, Users, Phone } from 'lucide-react';
+import { Calendar, Clock, Trash2, Zap, AlertCircle, CheckCircle2, Users, Phone } from 'lucide-react';
 import { PageHeader } from '../components/PageHeader';
 import { sessionApi, messageApi, type Session } from '../services/api';
 import './Scheduler.css';
@@ -88,8 +88,8 @@ export function Scheduler() {
 
   
   const handleScheduleServer = async () => {
-    if (!selectedSession || !targetNumber || !messageText || !date || !time) {
-      toast.error(isEn ? 'Please fill all fields' : 'الرجاء تعبئة جميع الحقول');
+    if (!selectedSession || !targetNumber || !message || !date || !time) {
+      alert(isEn ? 'Please fill all fields' : 'الرجاء تعبئة جميع الحقول');
       return;
     }
 
@@ -99,12 +99,12 @@ export function Scheduler() {
     try {
       scheduledDate = new Date(dateTimeStr);
     } catch(e) {
-      toast.error('Invalid Date/Time');
+      alert('Invalid Date/Time');
       return;
     }
 
     if (scheduledDate <= new Date()) {
-      toast.error(isEn ? 'Time must be in the future' : 'يجب أن يكون الوقت في المستقبل');
+      alert(isEn ? 'Time must be in the future' : 'يجب أن يكون الوقت في المستقبل');
       return;
     }
 
@@ -119,21 +119,21 @@ export function Scheduler() {
         body: JSON.stringify({
           sessionId: selectedSession,
           chatId: targetNumber.includes('@') ? targetNumber : `${targetNumber.replace(/[^0-9]/g, '')}@c.us`,
-          message: messageText,
+          message: message,
           scheduledAt: scheduledDate.toISOString()
         })
       });
 
       if (response.ok) {
-        toast.success(isEn ? 'Scheduled successfully! You can safely close the browser.' : 'تمت الجدولة بنجاح! يمكنك إغلاق المتصفح الآن وسيتكفل السيرفر بالباقي.');
-        setMessageText('');
+        alert(isEn ? 'Scheduled successfully! You can safely close the browser.' : 'تمت الجدولة بنجاح! يمكنك إغلاق المتصفح الآن وسيتكفل السيرفر بالباقي.');
+        setMessage('');
         // We can reload the local list by fetching from the server if we want, but for now we'll just alert
       } else {
-        toast.error(isEn ? 'Failed to schedule' : 'حدث خطأ أثناء الجدولة في السيرفر');
+        alert(isEn ? 'Failed to schedule' : 'حدث خطأ أثناء الجدولة في السيرفر');
       }
     } catch (err) {
       console.error(err);
-      toast.error(isEn ? 'Cannot connect to Scheduler Daemon (Port 2887)' : 'تعذر الاتصال بسيرفر الجدولة الخلفي (تأكد من تشغيله)');
+      alert(isEn ? 'Cannot connect to Scheduler Daemon (Port 2887)' : 'تعذر الاتصال بسيرفر الجدولة الخلفي (تأكد من تشغيله)');
     }
   };
 
@@ -151,7 +151,7 @@ export function Scheduler() {
     let targetName = finalTarget;
     if (targetType === 'group') {
       const g = groups.find(x => x.id === selectedGroup);
-      if (g && g.name) targetName = g.name;
+      if (g && g.name) { targetName = g.name || ''; }
     }
 
     const newMessage: ScheduledMessage = {
