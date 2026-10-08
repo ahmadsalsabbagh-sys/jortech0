@@ -660,3 +660,24 @@ p, span, div {
 .dark .text-muted, .dark .page-subtitle, .dark .page-header__subtitle {
   color: #94a3b8;
 }
+
+
+
+/* Global Desktop Zoom Scale for Pro UI */
+@media (min-width: 1024px) {
+  body {
+    zoom: 0.80;
+  }
+}
+/* Firefox fallback */
+@-moz-document url-prefix() {
+  @media (min-width: 1024px) {
+    body {
+      transform: scale(0.80);
+      transform-origin: top center;
+      width: 125vw;
+      height: 125vh;
+      overflow-x: hidden;
+    }
+  }
+}
