@@ -24,7 +24,7 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "node scheduler-daemon.js & node dist/main",
     "prod": "npm run build:all && node dist/main",
     "dev": "concurrently -n api,dashboard -c blue,green \"npm run start:dev\" \"npm run dashboard:dev\"",
     "dashboard:install": "cd dashboard && npm install",

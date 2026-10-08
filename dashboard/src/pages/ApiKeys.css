@@ -55,7 +55,7 @@
 }
 
 .api-keys-page .keys-table tbody tr.table-row:hover {
-  background: rgba(37, 211, 102, 0.05);
+  background: rgba(0, 114, 255, 0.05);
 }
 
 .api-keys-page .keys-table tbody tr.table-row:nth-child(even) {
@@ -63,7 +63,7 @@
 }
 
 .api-keys-page .keys-table tbody tr.table-row:nth-child(even):hover {
-  background: rgba(37, 211, 102, 0.05);
+  background: rgba(0, 114, 255, 0.05);
 }
 
 .api-keys-page .name-cell {
@@ -113,7 +113,7 @@
 }
 
 .api-keys-page .permission-badge:first-child:last-child {
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   color: var(--primary-text);
 }
 
@@ -205,8 +205,8 @@
 }
 
 .api-keys-page .session-scope-option:has(input:checked) {
-  border-color: rgba(37, 211, 102, 0.45);
-  background: rgba(37, 211, 102, 0.08);
+  border-color: rgba(0, 114, 255, 0.45);
+  background: rgba(0, 114, 255, 0.08);
 }
 
 .api-keys-page .session-scope-meta {
@@ -291,7 +291,7 @@
 .api-keys-page .perm-item code {
   font-size: 0.8125rem;
   color: var(--primary-text);
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   padding: 0.25rem 0.5rem;
   border-radius: 4px;
   width: fit-content;
@@ -461,7 +461,7 @@
 }
 
 .api-keys-page .status-badge.active {
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   color: var(--primary-text);
 }
 
@@ -602,3 +602,4 @@
     padding: 0.75rem;
   }
 }
+

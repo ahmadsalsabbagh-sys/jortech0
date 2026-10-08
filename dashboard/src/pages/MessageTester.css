@@ -148,7 +148,7 @@
 }
 
 .message-tester .response-status.success {
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   color: var(--primary-text);
 }
 
@@ -515,7 +515,7 @@
 }
 
 .message-tester .batch-badge.completed {
-  background: rgba(37, 211, 102, 0.12);
+  background: rgba(0, 114, 255, 0.12);
   color: var(--primary-text);
 }
 
@@ -629,3 +629,4 @@
   margin: 0;
   min-width: 0;
 }
+

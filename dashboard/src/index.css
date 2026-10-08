@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   font-family: 'Plus Jakarta Sans Variable', 'Plus Jakarta Sans', system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.6;
   font-weight: 400;
@@ -10,7 +10,7 @@ html[dir='rtl'] {
 }
 
 html[lang='ar'] {
-  font-family: 'Noto Sans Arabic Variable', 'Noto Sans Arabic', 'Cairo', 'Tajawal', 'Segoe UI', Arial, sans-serif;
+  font-family: 'Cairo', 'Noto Sans Arabic', 'Cairo', 'Tajawal', 'Segoe UI', Arial, sans-serif;
 }
 
 :root {
@@ -43,7 +43,7 @@ h1 {
   letter-spacing: -0.025em;
 }
 
-/* h2 is a real heading again — the old global made EVERY h2 a small uppercase eyebrow, which
+/* h2 is a real heading again â€” the old global made EVERY h2 a small uppercase eyebrow, which
    forced pages to keep resetting it (and left section titles smaller than body text). The eyebrow
    look is now opt-in via .eyebrow for the section/card labels that actually want it. */
 h2 {
@@ -70,7 +70,7 @@ h3 {
 }
 
 button {
-  border-radius: 8px;
+  border-radius: 50px;
   border: 1px solid transparent;
   padding: 0.6em 1.2em;
   font-size: 1em;
@@ -79,12 +79,12 @@ button {
   cursor: pointer;
   transition: border-color 0.25s;
 }
-/* Visible keyboard focus — cross-browser and keyboard-only, so the ring guides Tab navigation
+/* Visible keyboard focus â€” cross-browser and keyboard-only, so the ring guides Tab navigation
    without flashing on every mouse click. */
 button:focus-visible,
 a:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid var(--primary, #25d366);
+  outline: 2px solid var(--primary, #0072ff);
   outline-offset: 2px;
 }
 button:focus:not(:focus-visible) {
@@ -122,19 +122,19 @@ select {
   background-position: right 0.75rem center;
   background-size: 16px;
   border: 1px solid var(--border, #e2e8f0);
-  border-radius: 8px;
+  border-radius: 50px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
 select:hover {
-  border-color: var(--primary, #25d366);
+  border-color: var(--primary, #0072ff);
 }
 
 select:focus {
   outline: none;
-  border-color: var(--primary, #25d366);
-  box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.1);
+  border-color: var(--primary, #0072ff);
+  box-shadow: 0 0 0 3px rgba(0, 114, 255, 0.1);
 }
 
 select:disabled {
@@ -176,14 +176,14 @@ select:disabled {
   max-width: 480px;
   animation: slideUp 0.3s ease;
   /* Cap height and lay out as a flex column so the body scrolls while the header and footer stay
-     pinned — config-heavy modals no longer push the title/Save button off-screen. */
+     pinned â€” config-heavy modals no longer push the title/Save button off-screen. */
   display: flex;
   flex-direction: column;
   max-height: 90vh;
   overflow: hidden;
 }
 
-/* The install-plugin modal holds the catalog list — a bit wider on desktop for comfortable reading.
+/* The install-plugin modal holds the catalog list â€” a bit wider on desktop for comfortable reading.
    The responsive rules below (<=768px: 95% width; <=480px: full-width bottom sheet) still apply, so
    it stays responsive on small screens. Lives here (global modal styles) rather than in a page CSS
    so it isn't subject to the page-root scoping rule. */
@@ -239,7 +239,7 @@ select:disabled {
   width: 100%;
   padding: 0.875rem 1rem;
   border: 1px solid var(--border, #e2e8f0);
-  border-radius: 8px;
+  border-radius: 50px;
   font-size: 0.9375rem;
   background: var(--bg-light, #f8fafc);
   transition: all 0.2s;
@@ -248,9 +248,9 @@ select:disabled {
 
 .modal-body input:focus {
   outline: none;
-  border-color: var(--primary, #25d366);
+  border-color: var(--primary, #0072ff);
   background: var(--bg-white, #fff);
-  box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.1);
+  box-shadow: 0 0 0 3px rgba(0, 114, 255, 0.1);
 }
 
 /* The rule above is meant for TEXT inputs. Radios/checkboxes would otherwise stretch to width:100%
@@ -285,7 +285,7 @@ select:disabled {
   height: 36px;
   background: var(--bg-light, #f8fafc);
   border: 1px solid var(--border, #e2e8f0);
-  border-radius: 8px;
+  border-radius: 50px;
   cursor: pointer;
   color: var(--text-secondary, #64748b);
   transition: all 0.2s;
@@ -318,7 +318,7 @@ select:disabled {
   background: var(--bg-light, #f8fafc);
   color: var(--text-secondary, #64748b);
   border: 1px solid var(--border, #e2e8f0);
-  border-radius: 8px;
+  border-radius: 50px;
   font-size: 0.9375rem;
   font-weight: 600;
   cursor: pointer;
@@ -336,19 +336,19 @@ select:disabled {
   cursor: not-allowed;
 }
 
-/* Primary Button — canonical definition; page-scoped copies were consolidated here so the
+/* Primary Button â€” canonical definition; page-scoped copies were consolidated here so the
    primary CTA looks identical on every page (padding/radius/disabled used to drift per page). */
 .btn-primary {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.75rem 1.25rem;
-  background: var(--primary, #25d366);
+  background: linear-gradient(135deg, #00c6ff, #0072ff);
   /* Dark text on the WhatsApp green: 9.0:1 (AAA). White was 1.98:1, failing even the AA
      large-text floor - the single worst contrast pair in the dashboard. */
-  color: #0f172a;
+  color: #ffffff;
   border: none;
-  border-radius: 8px;
+  border-radius: 50px;
   font-size: 0.9375rem;
   font-weight: 600;
   cursor: pointer;
@@ -356,7 +356,7 @@ select:disabled {
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--primary-hover, #1da851);
+  background: var(--primary-hover, #0052d4);
 }
 
 .btn-primary:disabled {
@@ -364,7 +364,7 @@ select:disabled {
   cursor: not-allowed;
 }
 
-/* Danger Button — canonical definition (page copies also used two different base reds). */
+/* Danger Button â€” canonical definition (page copies also used two different base reds). */
 .btn-danger {
   display: inline-flex;
   align-items: center;
@@ -373,7 +373,7 @@ select:disabled {
   background: var(--error, #ef4444);
   color: #fff;
   border: none;
-  border-radius: 8px;
+  border-radius: 50px;
   font-size: 0.9375rem;
   font-weight: 600;
   cursor: pointer;
@@ -447,7 +447,7 @@ code {
   text-align: right;
 }
 
-/* URLs, emails, phones — force LTR even inside RTL */
+/* URLs, emails, phones â€” force LTR even inside RTL */
 [dir='rtl'] input[type='url'],
 [dir='rtl'] input[type='email'],
 [dir='rtl'] input[type='tel'] {
@@ -455,7 +455,7 @@ code {
   text-align: left;
 }
 
-/* Toast container — slide in from the opposite side */
+/* Toast container â€” slide in from the opposite side */
 [dir='rtl'] .toast-container {
   right: auto;
   left: 1rem;
@@ -512,4 +512,151 @@ code {
     /* max-height + body scroll already come from the base .modal rule; the bottom-sheet only
        changes width/anchoring. (Scrolling lives on .modal-body to avoid a double scrollbar.) */
   }
+}
+
+
+
+/* JOR Tech Global Theme Modifiers */
+body {
+  background-attachment: fixed !important;
+}
+
+:root[data-theme='light'] body,
+body {
+  background: linear-gradient(180deg, #f0f9ff 0%, #e0f2fe 50%, #bae6fd 100%) !important;
+}
+
+[data-theme='dark'] body {
+  background-color: #070D1A !important;
+  background-image: 
+      radial-gradient(at 0% 0%, rgba(0, 210, 255, 0.15) 0px, transparent 48%),
+      radial-gradient(at 100% 0%, rgba(0, 114, 255, 0.15) 0px, transparent 48%),
+      radial-gradient(at 50% 100%, rgba(10, 25, 47, 0.95) 0px, transparent 65%),
+      linear-gradient(180deg, #070D1A 0%, #0A192F 100%) !important;
+}
+
+.sidebar, 
+.modal,
+.card, .login-card, .chart-card, .stats-card, .stat-card,
+.glass-panel,
+.chat-container,
+.plugins-container,
+.custom-select-options,
+.room-list {
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+  background: var(--bg-card) !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.5);
+  border-left: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+[data-theme='dark'] .sidebar, 
+[data-theme='dark'] [data-theme='dark'] .modal,
+[data-theme='dark'] .card,
+[data-theme='dark'] .login-card {
+  border-top: 1px solid rgba(0, 210, 255, 0.15);
+  border-left: 1px solid rgba(0, 210, 255, 0.15);
+}
+
+/* Enhancing inputs and forms */
+input, select, textarea {
+  background: var(--bg-white) !important;
+  backdrop-filter: blur(8px);
+}
+/* Global Page Header Override to perfectly blend into backgrounds */
+.page-header {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  padding: 0 !important;
+  margin-bottom: 2rem;
+}
+[data-theme='dark'] .page-header {
+  border: none !important;
+}
+
+
+/* =========================================
+   PREMIUM TYPOGRAPHY & TEXT DESIGN
+   ========================================= */
+
+/* Force clean font rendering and apply Cairo strictly to EVERYTHING */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body, html {
+  font-family: 'Cairo', 'Tajawal', system-ui, sans-serif !important;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Cairo', 'Tajawal', system-ui, sans-serif !important;
+  font-weight: 800;
+  letter-spacing: -0.2px;
+  line-height: 1.3;
+}
+
+/* Ensure inputs, buttons, and textareas inherit the beautiful font */
+input, select, textarea, button {
+  font-family: 'Cairo', 'Tajawal', system-ui, sans-serif !important;
+}
+
+/* Beautify the main page titles (like لوحة التحكم, الإرسال الجماعي) */
+.page-title, .modern-page-header h1 {
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 0px 2px 10px rgba(0,0,0,0.03);
+  font-weight: 900 !important;
+}
+[data-theme='dark'] .page-title,
+.dark .page-title,
+[data-theme='dark'] .modern-page-header h1,
+.dark .modern-page-header h1 {
+  background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 0px 2px 15px rgba(255,255,255,0.1);
+}
+
+/* Beautify panel titles inside the cards (like 1. رقم الواتساب المرسل) */
+.panel-title, .card-title, .step-label {
+  font-weight: 800 !important;
+  letter-spacing: 0;
+}
+
+.step-label {
+  font-size: 1.1rem !important;
+  color: #1e293b;
+}
+.dark .step-label {
+  color: #f1f5f9;
+}
+
+/* Refine all generic labels and hints */
+label {
+  font-weight: 700;
+  color: #334155;
+  font-size: 0.95rem;
+}
+.dark label {
+  color: #cbd5e1;
+}
+
+p, span, div {
+  line-height: 1.6;
+}
+
+/* Modernize standard text blocks */
+.text-muted, .page-subtitle, .page-header__subtitle {
+  font-weight: 600;
+  color: #64748b;
+  letter-spacing: 0.2px;
+}
+.dark .text-muted, .dark .page-subtitle, .dark .page-header__subtitle {
+  color: #94a3b8;
 }

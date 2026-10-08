@@ -369,7 +369,7 @@
   height: 18px;
   min-width: 18px;
   padding: 0 4px;
-  background: var(--primary, #25d366);
+  background: var(--primary, #0072ff);
   color: white;
   font-size: 0.68rem;
   font-weight: 700;
@@ -1821,3 +1821,4 @@
   color: var(--text-muted);
   margin-top: 0.3rem;
 }
+

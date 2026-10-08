@@ -1,4 +1,4 @@
-﻿{
+{
   "toast": {
     "connectionLost": {
       "title": "Server Connection Lost",
@@ -68,7 +68,9 @@
     "messageTester": "Message Tester",
     "infrastructure": "Infrastructure",
     "plugins": "Plugins",
-    "logs": "Logs"
+    "logs": "Logs",
+    "bulkSender": "Bulk Sender",
+    "scheduler": "Scheduler"
   },
   "chats": {
     "media": {
@@ -1165,5 +1167,25 @@
       "current": "This session"
     },
     "loading": "Searching…"
+  },
+  "layout": {
+    "nav": {
+      "bulkSender": "Bulk Sender",
+      "scheduler": "Scheduler"
+    }
+  },
+  "bulkSender": {
+    "title": "Bulk Sender",
+    "subtitle": "Send messages to multiple contacts with delays",
+    "sessionSelect": "Select Session",
+    "targetNumbers": "Target Numbers (one per line, e.g. 96279...)",
+    "messageText": "Message Content",
+    "delayLabel": "Delay between messages (seconds)",
+    "randomizeDelay": "Randomize delay (adds +/- 50%)",
+    "sendBtn": "Start Sending",
+    "sending": "Sending...",
+    "success": "Batch started successfully!",
+    "error": "Failed to send",
+    "requiredFields": "Session, Numbers, and Message are required"
   }
 }

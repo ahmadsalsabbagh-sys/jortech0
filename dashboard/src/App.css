@@ -1,20 +1,20 @@
-:root {
-  --primary: #25d366;
+﻿:root {
+  --primary: #0072ff;
   /* The brand green as FOREGROUND is 1.98:1 on white, far under the 4.5:1 AA needs for text.
      It stays the fill colour; anything rendering it as text or an icon uses --primary-text, the same
      hue darkened until it clears 4.5:1 on all three light backgrounds it lands on: 4.95:1 on white,
      4.73:1 on --bg-light, and 4.53:1 on --primary-soft, which is the tightest of the three and the
      one the active sidebar item uses. */
-  --primary-text: #17813e;
-  --primary-hover: #1da851;
-  --primary-soft: rgba(37, 211, 102, 0.12);
-  --bg-light: #f8fafc;
-  --bg-white: #ffffff;
-  --bg-card: #ffffff;
+  --primary-text: #0044ff;
+  --primary-hover: #0052d4;
+  --primary-soft: rgba(0, 114, 255, 0.12);
+  --bg-light: #f0f9ff;
+  --bg-white: rgba(255, 255, 255, 0.85);
+  --bg-card: rgba(255, 255, 255, 0.5);
   --text-primary: #0f172a; /* Slate 900 */
   --text-secondary: #475569; /* Slate 600 */
   --text-muted: #64748b; /* Slate 500; 4.76:1 on white (AA) */
-  --border: #e2e8f0; /* Slate 200 */
+  --border: rgba(255, 255, 255, 0.7); /* Slate 200 */
   --error: #ef4444;
   --success: #22c55e;
   --warning: #f59e0b;
@@ -25,27 +25,27 @@
   --error-text: #c63838;
   --success-text: #157c3b;
   --warning-text: #986207;
-  --info: #2563eb; /* Blue 600 — info/permission/log badges + qr-ready pill */
+  --info: #00c6ff; /* Blue 600 â€” info/permission/log badges + qr-ready pill */
   --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
   --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
   --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-  --radius: 10px;
+  --radius: 16px;
 }
 
 /* Dark Mode */
 [data-theme='dark'] {
   /* Make native controls (select option popups, scrollbars, date pickers) follow the EXPLICIT
-     app theme, not just the OS preference — otherwise toggling dark while the OS is light left
+     app theme, not just the OS preference â€” otherwise toggling dark while the OS is light left
      native dropdowns rendered in the light scheme (#249). */
   color-scheme: dark;
-  --bg-light: #0f172a; /* Slate 900 */
-  --bg-white: #1e293b; /* Slate 800 */
-  --bg-card: #1e293b;
+  --bg-light: #070D1A; /* Slate 900 */
+  --bg-white: rgba(10, 25, 47, 0.85); /* Slate 800 */
+  --bg-card: rgba(10, 25, 47, 0.55);
   --text-primary: #f1f5f9; /* Slate 100 */
   --text-secondary: #cbd5e1; /* Slate 300 */
   --text-muted: #94a3b8; /* Slate 400; 5.71:1 on Slate 800 (AA) */
-  --border: #334155; /* Slate 700 */
-  --info: #60a5fa; /* Blue 400 — lighter so it reads over the dark translucent-blue tints */
+  --border: rgba(0, 210, 255, 0.3); /* Slate 700 */
+  --info: #00D2FF; /* Blue 400 â€” lighter so it reads over the dark translucent-blue tints */
   /* On the dark surfaces success and warning already clear AA (6.42:1 and 6.81:1), so they
      keep their base value; error is 3.89:1 on Slate 800 and is lightened instead, to a value that still
      clears 4.65:1 on the darkest error tint behind it (20 percent over Slate 800). */
@@ -74,14 +74,14 @@
        has no data-theme and relies solely on this block: without an explicit color-scheme the popup
        rendered light, leaving the light option text illegible (#249). */
     color-scheme: dark;
-    --bg-light: #0f172a;
-    --bg-white: #1e293b;
-    --bg-card: #1e293b;
+    --bg-light: #070D1A;
+    --bg-white: rgba(10, 25, 47, 0.85);
+    --bg-card: rgba(10, 25, 47, 0.55);
     --text-primary: #f1f5f9;
     --text-secondary: #cbd5e1;
     --text-muted: #94a3b8;
-    --border: #334155;
-    --info: #60a5fa;
+    --border: rgba(0, 210, 255, 0.3);
+    --info: #00D2FF;
     /* On the dark surfaces success and warning already clear AA (6.42:1 and 6.81:1), so they
        keep their base value; error is 3.89:1 on Slate 800 and is lightened instead, to a value that still
        clears 4.65:1 on the darkest error tint behind it (20 percent over Slate 800). */
@@ -89,7 +89,7 @@
     --success-text: var(--success);
     --warning-text: var(--warning);
     --primary-soft: color-mix(in srgb, var(--primary) 18%, transparent);
-    /* Must be restated here, not inherited: the light value (#17813e) measures 2.96:1 on Slate 800
+    /* Must be restated here, not inherited: the light value (#0044ff) measures 2.96:1 on Slate 800
        and would fail worse than the brand green it replaced. On dark the brand green is 7.38:1. */
     --primary-text: var(--primary);
     --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
@@ -135,7 +135,7 @@ a:hover {
   text-decoration: underline;
 }
 
-/* Error banner — shared across pages (moved out of Plugins.css so any page can use it). */
+/* Error banner â€” shared across pages (moved out of Plugins.css so any page can use it). */
 .error-banner {
   background: rgba(239, 68, 68, 0.1);
   border: 1px solid rgba(239, 68, 68, 0.3);
@@ -155,10 +155,12 @@ a:hover {
   color: var(--error-text);
 }
 
-/* yarl theme — match dashboard dark palette. */
+/* yarl theme â€” match dashboard dark palette. */
 .yarl__container {
   --yarl__color_backdrop: rgba(0, 0, 0, 0.92);
 }
 .yarl__button {
   --yarl__color_button: rgba(255, 255, 255, 0.9);
 }
+
+

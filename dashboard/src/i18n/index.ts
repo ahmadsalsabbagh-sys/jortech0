@@ -1,61 +1,27 @@
-import i18n from 'i18next';
+﻿import i18n from 'i18next';
 import type { BackendModule, ReadCallback, ResourceKey } from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 
-export const supportedLanguages = [
-  'en',
-  'de',
-  'es',
-  'he',
-  'tr',
-  'zh-CN',
-  'zh-HK',
-  'ar',
-  'te',
-  'fr',
-  'it',
-  'pt-BR',
-  'ko',
-  'hi',
-  'id',
-] as const;
+export const supportedLanguages = ['ar', 'en'] as const;
 export type SupportedLanguage = (typeof supportedLanguages)[number];
 
-export const rtlLanguages: SupportedLanguage[] = ['he', 'ar'];
+export const rtlLanguages: SupportedLanguage[] = ['ar'];
 
 export const languageOptions: Array<{ value: SupportedLanguage; label: string; compactLabel: string }> = [
+  { value: 'ar', label: '\u0627\u0644\u0639\u0631\u0628\u064A\u0629', compactLabel: 'AR' },
   { value: 'en', label: 'English', compactLabel: 'EN' },
-  { value: 'de', label: 'Deutsch', compactLabel: 'DE' },
-  { value: 'tr', label: 'Türkçe', compactLabel: 'TR' },
-  { value: 'es', label: 'Español', compactLabel: 'ES' },
-  { value: 'he', label: 'עברית', compactLabel: 'עברית' },
-  { value: 'zh-CN', label: '简体中文', compactLabel: '简中' },
-  { value: 'zh-HK', label: '繁體中文', compactLabel: '繁中' },
-  { value: 'ar', label: 'العربية', compactLabel: 'AR' },
-  { value: 'te', label: 'తెలుగు', compactLabel: 'TE' },
-  { value: 'fr', label: 'Français', compactLabel: 'FR' },
-  { value: 'it', label: 'Italiano', compactLabel: 'IT' },
-  { value: 'pt-BR', label: 'Português (Brasil)', compactLabel: 'PT' },
-  { value: 'ko', label: '한국어', compactLabel: 'KO' },
-  { value: 'hi', label: 'हिन्दी', compactLabel: 'HI' },
-  { value: 'id', label: 'Bahasa Indonesia', compactLabel: 'ID' },
 ];
 
 export function resolveSupportedLanguage(lang?: string): SupportedLanguage {
-  const value = lang || 'en';
+  const value = lang || 'ar';
   const exact = supportedLanguages.find(supported => supported.toLowerCase() === value.toLowerCase());
   if (exact) return exact;
 
   const parts = value.toLowerCase().split('-');
   const base = parts[0];
-  if (base === 'zh') {
-    const subtags = new Set(parts.slice(1));
-    if (subtags.has('hant') || subtags.has('hk') || subtags.has('mo') || subtags.has('tw')) return 'zh-HK';
-    return 'zh-CN';
-  }
 
-  return supportedLanguages.find(supported => supported === base) ?? 'en';
+  return supportedLanguages.find(supported => supported === base) ?? 'ar';
 }
 
 /**
@@ -80,12 +46,12 @@ const lazyLocaleBackend: BackendModule = {
 };
 
 /**
- * Keyed to `resolvedLanguage` — the language whose catalogue actually answered — rather than to the
+ * Keyed to `resolvedLanguage` â€” the language whose catalogue actually answered â€” rather than to the
  * one that was requested, which is the expression `Layout` and `Login` already use to label the
  * picker. The two could not disagree while every catalogue was bundled; now that they are fetched
  * they can. A chunk that 404s (a tab left open across a redeploy is the realistic way) still sets
  * `language`, still emits this event and still gets cached by the detector, while `t()` serves the
- * English fallback — so following the request would dress English copy right-to-left and leave the
+ * English fallback â€” so following the request would dress English copy right-to-left and leave the
  * picker reading EN against an `ar` document.
  */
 function applyDirection() {
@@ -99,7 +65,7 @@ function applyDirection() {
 
 // Subscribed before init, which is also what sets the initial direction: init resolves the detected
 // language through `changeLanguage`, so the first event is the initial one. Registering afterwards
-// happens to work too, but only because init defers — this way the order cannot matter.
+// happens to work too, but only because init defers â€” this way the order cannot matter.
 i18n.on('languageChanged', applyDirection);
 
 export const i18nReady = i18n
@@ -107,7 +73,7 @@ export const i18nReady = i18n
   .use(LanguageDetector)
   .use(initReactI18next)
   .init({
-    fallbackLng: 'en',
+    fallbackLng: 'ar',
     supportedLngs: supportedLanguages as unknown as string[],
     nonExplicitSupportedLngs: false,
     interpolation: { escapeValue: false },

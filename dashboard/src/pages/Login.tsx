@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Languages } from 'lucide-react';
-import { GithubIcon } from '../components/GithubIcon';
 import { CustomSelect } from '../components/CustomSelect';
 import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { API_BASE_URL } from '../services/api';
@@ -25,7 +24,6 @@ export function Login({ onLogin }: LoginProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // The stored key is matched against key prefixes elsewhere, so a pasted space must not reach it.
     const key = apiKey.trim();
     if (!key) {
       setError(t('login.apiKeyRequired'));
@@ -35,17 +33,8 @@ export function Login({ onLogin }: LoginProps) {
     setError('');
 
     try {
-      const response = await fetch(`${API_BASE_URL}/auth/validate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': key,
-        },
-      });
-
+      const response = await fetch(API_BASE_URL + '/auth/validate', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': key } });
       if (response.ok) {
-        // The validate body already carries the key's role — hand it up so the app can set it
-        // directly instead of re-validating the same key a second time.
         const data: { role?: string; engineType?: string; scoped?: unknown } = await response.json().catch(() => ({}));
         onLogin(
           key,
@@ -54,8 +43,6 @@ export function Login({ onLogin }: LoginProps) {
           data.scoped === true,
         );
       } else {
-        // A 5xx, or a body that is not the gateway's JSON (a proxy error page while it restarts), says
-        // nothing about the key; a refusal keeps the gateway's reason (expired, revoked, rate limited).
         const errorData: { message?: unknown } = await response.json().catch(() => ({}));
         const reason = response.status < 500 && typeof errorData.message === 'string' ? errorData.message : '';
         setError(reason || t(response.status === 401 ? 'login.invalidKey' : 'login.connectionError'));
@@ -67,83 +54,88 @@ export function Login({ onLogin }: LoginProps) {
     }
   };
 
+  const isEn = currentLang === 'en';
+  const marketingTitle = isEn ? 'Professional Digital Solutions' : 'حلول رقمية احترافية متكاملة';
+  const marketingSub = isEn ? 'Join us now and benefit from our smart tools.' : 'انضم إلينا الآن واستفد من أدواتنا الذكية.';
+  const loginTitle = isEn ? 'Login' : 'تسجيل الدخول';
+  const loginSub = isEn ? 'Welcome back to JOR Tech' : 'مرحباً بك مجدداً في JOR Tech';
+  const loginBtn = isEn ? 'Login ➜' : 'دخول ➜';
+
   return (
     <div className="login-container">
-      <div className="login-card">
-        <div className="login-logo" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-          <img 
-            src="https://www.jortechjo.com/uploads/settings/69ff8042503c0.png" 
-            alt="JOR Tech" 
-            className="logo-icon" 
-            style={{ maxHeight: '80px', width: 'auto', objectFit: 'contain', marginBottom: '10px' }} 
-          />
-          <h2 style={{ fontSize: '1.25rem', fontWeight: 700, margin: '4px 0', color: 'inherit' }}>
-            منصة وأكاديمية JOR Tech
-          </h2>
-          <span className="version-info" style={{ fontSize: '0.85rem', color: '#3b82f6', fontWeight: 600 }}>
-            نظام إدارة وأتمتة الواتساب | v{__APP_VERSION__}
-          </span>
-        </div>
-
-        <div className="login-language">
-          <Languages size={18} />
-          <CustomSelect
-            value={currentLang}
-            onChange={value => changeLanguage(value as SupportedLanguage)}
-            options={languageOptions.map(opt => ({ value: opt.value, label: opt.label }))}
-            ariaLabel={t('common.language')}
-          />
-        </div>
-
-        <form onSubmit={handleSubmit} className="login-form">
-          <div className="input-group">
-            <label htmlFor="apiKey">{t('login.apiKey')}</label>
-            <div className="input-wrapper">
-              <input
-                id="apiKey"
-                type={showKey ? 'text' : 'password'}
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder={t('login.apiKeyPlaceholder')}
-                className={error ? 'error' : ''}
-              />
-              <button
-                type="button"
-                className="toggle-visibility"
-                onClick={() => setShowKey(!showKey)}
-                aria-label={showKey ? t('common.hideApiKey') : t('common.showApiKey')}
-              >
-                {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
-              </button>
-            </div>
-            {error && <span className="error-message">{error}</span>}
+      <div className={`login-card ${isEn ? 'is-en' : 'is-ar'}`}>
+        
+        {/* Left Side (Blue Panel) */}
+        <div className="login-blue-panel">
+          <div className="login-logo-wrapper">
+            <img 
+              src="https://www.jortechjo.com/uploads/settings/69ff8042503c0.png" 
+              alt="JOR Tech" 
+              className="logo-icon-large" 
+            />
           </div>
+          <h2 className="login-brand-title">JOR Tech</h2>
+          <div className="login-marketing-box">
+            <p>{marketingTitle}<br/>{marketingSub}</p>
+          </div>
+        </div>
 
-          <button type="submit" className="connect-btn" disabled={isLoading}>
-            {isLoading ? t('login.connecting') : t('login.connect')}
-          </button>
-        </form>
+        {/* Right Side (Form Panel) */}
+        <div className="login-white-panel">
+          <h2 className="login-title">{loginTitle}</h2>
+          <p className="login-subtitle">{loginSub}</p>
 
-        <p className="login-help">
-          هل تحتاج مساعدة؟{' '}
-          <a href="https://www.jortechjo.com" target="_blank" rel="noopener noreferrer" style={{ fontWeight: 600 }}>
-            زيارة منصة JOR Tech
-          </a>
-        </p>
+          <form onSubmit={handleSubmit} className="login-form">
+            <div className="login-language">
+              <Languages size={18} />
+              <CustomSelect
+                value={currentLang}
+                onChange={value => changeLanguage(value as SupportedLanguage)}
+                options={languageOptions.map(opt => ({ value: opt.value, label: opt.label }))}
+                ariaLabel={t('common.language')}
+              />
+            </div>
+
+            <div className="input-group">
+              <div className="input-wrapper">
+                <input
+                  id="apiKey"
+                  type={showKey ? 'text' : 'password'}
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  placeholder={t('login.apiKeyPlaceholder') || 'أدخل مفتاح API الخاص بك'}
+                  className={error ? 'error' : ''}
+                  dir="ltr"
+                />
+                <button
+                  type="button"
+                  className="toggle-visibility"
+                  onClick={() => setShowKey(!showKey)}
+                  aria-label="Toggle visibility"
+                >
+                  {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
+                </button>
+              </div>
+              {error && <span className="error-message">{error}</span>}
+            </div>
+
+            <button type="submit" className="connect-btn" disabled={isLoading}>
+              {isLoading ? t('login.connecting') : loginBtn}
+            </button>
+          </form>
+
+          <p className="login-help">
+            {isEn ? 'Need help? Visit our ' : 'للحصول على مساعدة يرجى مراجعة ' }
+            <a href="https://www.jortechjo.com" target="_blank" rel="noopener noreferrer">
+              {isEn ? 'website' : 'موقعنا'}
+            </a>
+          </p>
+
+          <footer className="login-footer">
+            <span>{isEn ? 'JOR Tech Dashboard | Version ' : 'لوحة تحكم JOR Tech | الإصدار '} {__APP_VERSION__}</span>
+          </footer>
+        </div>
       </div>
-
-      <footer className="login-footer">
-        <span>منصة وأكاديمية JOR Tech | إشراف: أ. أحمد الصباغ</span>
-        <a
-          href="https://github.com/ahmadsalsabbagh-sys/jor-tech"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="github-link"
-          aria-label="GitHub"
-        >
-          <GithubIcon size={18} />
-        </a>
-      </footer>
     </div>
   );
 }

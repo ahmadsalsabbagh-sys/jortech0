@@ -61,7 +61,7 @@
 }
 
 .infrastructure-page .status-indicator.connected {
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   color: var(--primary-text);
 }
 
@@ -100,7 +100,7 @@
 
 .infrastructure-page .radio-option.selected {
   border-color: var(--primary);
-  background: rgba(37, 211, 102, 0.05);
+  background: rgba(0, 114, 255, 0.05);
 }
 
 .infrastructure-page .radio-option input {
@@ -743,3 +743,4 @@
   color: var(--error-text);
   margin-bottom: 1rem;
 }
+

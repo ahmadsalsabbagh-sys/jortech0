@@ -20,7 +20,7 @@
 }
 
 .dashboard .status-badge.connected {
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   color: var(--primary-text);
 }
 
@@ -222,7 +222,7 @@
 }
 
 .dashboard .status-pill.ready {
-  background: rgba(37, 211, 102, 0.1);
+  background: rgba(0, 114, 255, 0.1);
   color: var(--primary-text);
 }
 
@@ -375,4 +375,148 @@
   .dashboard {
     padding: 0.75rem;
   }
+}
+
+
+/* Modern Premium Stat Cards */
+.dashboard .stats-grid {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  margin-bottom: 2rem;
+}
+
+.dashboard .stat-card {
+  position: relative;
+  background: rgba(255, 255, 255, 0.7) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 24px;
+  padding: 2rem 1.8rem;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.8) !important;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 1;
+}
+
+[data-theme='dark'] .dashboard .stat-card,
+.dark .dashboard .stat-card {
+  background: rgba(30, 41, 59, 0.7) !important;
+  border-color: rgba(255, 255, 255, 0.05) !important;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+}
+
+.dashboard .stat-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 20px 40px rgba(14, 165, 233, 0.15);
+  border-color: rgba(14, 165, 233, 0.4) !important;
+}
+
+/* Beautiful Animated Watermark */
+.dashboard .stat-watermark {
+  display: block !important;
+  position: absolute;
+  bottom: -20px;
+  left: -20px; /* For RTL, it goes to the left corner */
+  width: 150px !important;
+  height: 150px !important;
+  opacity: 0.04;
+  color: #0ea5e9;
+  transform: rotate(15deg);
+  pointer-events: none;
+  z-index: 0;
+  transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  stroke-width: 1.5px !important;
+}
+
+.ltr .dashboard .stat-watermark {
+  left: auto;
+  right: -20px;
+  transform: rotate(-15deg);
+}
+
+.dashboard .stat-card:hover .stat-watermark {
+  opacity: 0.12;
+  transform: rotate(0deg) scale(1.15) translateY(-10px);
+  color: #0ea5e9;
+}
+
+[data-theme='dark'] .dashboard .stat-watermark,
+.dark .dashboard .stat-watermark {
+  opacity: 0.05;
+  color: #ffffff;
+}
+[data-theme='dark'] .dashboard .stat-card:hover .stat-watermark,
+.dark .dashboard .stat-card:hover .stat-watermark {
+  opacity: 0.1;
+  color: #38bdf8;
+}
+
+/* Ensure card content stays above watermark */
+.dashboard .stat-header,
+.dashboard .stat-value,
+.dashboard .stat-detail {
+  position: relative;
+  z-index: 2;
+}
+
+
+.dashboard .stat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 1.2rem;
+}
+
+.dashboard .stat-label {
+  font-size: 1.1rem;
+  font-weight: 800;
+  color: #334155;
+  line-height: 1.4;
+}
+[data-theme='dark'] .dashboard .stat-label,
+.dark .dashboard .stat-label {
+  color: #f1f5f9;
+}
+
+/* Beautiful icon container */
+.dashboard .stat-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.1), rgba(37, 99, 235, 0.1));
+  color: #0ea5e9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  box-shadow: 0 4px 15px rgba(14, 165, 233, 0.15);
+  transition: all 0.3s;
+}
+.dashboard .stat-card:hover .stat-icon {
+  background: linear-gradient(135deg, #0ea5e9, #2563eb);
+  color: white;
+  transform: scale(1.1) rotate(5deg);
+}
+
+.dashboard .stat-value {
+  font-size: 2.5rem;
+  font-weight: 900;
+  color: #0f172a;
+  letter-spacing: -1px;
+}
+[data-theme='dark'] .dashboard .stat-value,
+.dark .dashboard .stat-value {
+  color: #ffffff;
+}
+
+.dashboard .stat-detail {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: #64748b;
+  font-weight: 600;
 }
