@@ -15,7 +15,7 @@ interface ParsedContact {
 }
 
 export function BulkSender() {
-  const { t, i18n } = useTranslation();
+  const { i18n } = useTranslation();
   const isEn = i18n.language === 'en' || i18n.resolvedLanguage === 'en';
   
   const [sessions, setSessions] = useState<Session[]>([]);

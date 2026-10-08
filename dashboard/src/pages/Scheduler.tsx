@@ -16,7 +16,7 @@ interface ScheduledMessage {
 }
 
 export function Scheduler() {
-  const { t, i18n } = useTranslation();
+  const { i18n } = useTranslation();
   const isEn = i18n.language === 'en' || i18n.resolvedLanguage === 'en';
   
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -151,7 +151,7 @@ export function Scheduler() {
     let targetName = finalTarget;
     if (targetType === 'group') {
       const g = groups.find(x => x.id === selectedGroup);
-      if (g && g.name) { targetName = g.name || ''; }
+      targetName = (g && g.name) ? g.name : finalTarget;
     }
 
     const newMessage: ScheduledMessage = {
