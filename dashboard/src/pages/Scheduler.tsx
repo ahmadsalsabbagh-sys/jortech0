@@ -150,8 +150,10 @@ export function Scheduler() {
 
     let targetName = finalTarget;
     if (targetType === 'group') {
-      const g = groups.find(x => x.id === selectedGroup);
-      targetName = (g && g.name) ? g.name : finalTarget;
+      const g = groups.find(x => x.id === selectedGroup) as any;
+      if (g && g.name) {
+        targetName = String(g.name);
+      }
     }
 
     const newMessage: ScheduledMessage = {
