@@ -7,8 +7,7 @@
   justify-content: center;
   background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%);
   padding: 2rem;
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
+  position: relative;
   font-family: 'Cairo', sans-serif;
 }
 
@@ -20,7 +19,7 @@
   background: #fff;
   border-radius: 20px;
   box-shadow: 0 20px 50px rgba(0, 114, 255, 0.15);
-  overflow: hidden;
+  overflow: hidden; display: flex; flex-direction: row;
 }
 
 /* PANELS */
@@ -86,7 +85,7 @@
   justify-content: center;
   margin-bottom: 1.5rem;
   box-shadow: 0 8px 24px rgba(0,0,0,0.15);
-  overflow: hidden;
+  overflow: hidden; display: flex; flex-direction: row;
 }
 
 .logo-icon-large {
@@ -260,20 +259,35 @@
 }
 
 @media (max-width: 768px) {
+  .login-container {
+    padding: 1rem;
+    min-height: 100vh;
+    overflow-y: auto;
+  }
   .login-card {
     height: auto;
     min-height: 700px;
+    flex-direction: column !important;
+    overflow: visible;
   }
   .login-blue-panel,
   .login-white-panel {
-    position: static;
+    position: static !important;
     width: 100% !important;
     transform: none !important;
+    height: auto !important;
   }
   .login-blue-panel {
     padding: 2rem;
+    border-radius: 20px 20px 0 0;
   }
   .login-white-panel {
-    padding: 2rem;
+    padding: 2rem 1.5rem;
+    border-radius: 0 0 20px 20px;
+  }
+  .login-logo-wrapper {
+    width: 100px;
+    height: 100px;
+    margin-bottom: 1rem;
   }
 }
