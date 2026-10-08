@@ -1,11 +1,11 @@
-# OpenWA - Dockerfile
+﻿# OpenWA - Dockerfile
 # Multi-stage build for production-ready image
 
 # ===== Stage 1: Builder =====
 # Pin the builder to the BUILD host's platform (not the target's). It only produces arch-INDEPENDENT
 # artifacts (the NestJS dist/ JS and the static dashboard SPA), so it never needs to run emulated for
 # the non-native target. On a multi-arch buildx build this avoids QEMU emulating the whole npm ci +
-# Vite build for arm64 — which is slow AND is where the arm64 lightningcss (Vite 8's native CSS
+# Vite build for arm64 â€” which is slow AND is where the arm64 lightningcss (Vite 8's native CSS
 # minifier) optional dependency fails to install ("Cannot find module lightningcss.linux-arm64-gnu.node").
 # The per-arch runtime deps are installed natively in the target-platform production stage below.
 # NOTE: $BUILDPLATFORM requires BuildKit (CI uses buildx; modern `docker build`/compose default to it).
@@ -30,17 +30,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package*.json ./
 
 # The postinstall hook is a real file (scripts/postinstall.js), and `npm ci` fails outright when
-# a lifecycle script is missing — copy it BEFORE the install. dashboard/ and the backport patcher
+# a lifecycle script is missing â€” copy it BEFORE the install. dashboard/ and the backport patcher
 # are deliberately still absent at this point, so the hook cleanly no-ops here (dashboard deps are
 # installed explicitly below; the patcher only matters for the production stage).
 COPY scripts/postinstall.js ./scripts/
 
-# Install all dependencies INCLUDING devDependencies — the build needs them (`nest` from
+# Install all dependencies INCLUDING devDependencies â€” the build needs them (`nest` from
 # @nestjs/cli, plus `vite`/`typescript` for the dashboard). `--include=dev` is REQUIRED, not
 # cosmetic: npm omits devDependencies whenever NODE_ENV=production is present in the build env.
 # Coolify (and similar PaaS) promote every ${VAR} referenced in the compose file to a build-time
 # variable, so docker-compose.yml's `NODE_ENV=${NODE_ENV:-production}` leaks NODE_ENV=production
-# into this stage and a bare `npm ci` would skip @nestjs/cli → `sh: 1: nest: not found` (exit 127).
+# into this stage and a bare `npm ci` would skip @nestjs/cli â†’ `sh: 1: nest: not found` (exit 127).
 # (docker-compose.dev.yml forwards `NODE_ENV=${NODE_ENV:-development}`, so the dev build only sees
 # production when the host sets it.)
 # This stage only builds dist/ and the dashboard SPA and never launches a browser; the production
@@ -57,7 +57,7 @@ COPY . .
 # `--include=dev` for the same reason as above: the dashboard build needs vite/typescript
 # (devDependencies), which a NODE_ENV=production build env would otherwise omit.
 # Drop the incremental-build cache afterwards: it is pinned inside dist/ (so nest's deleteOutDir
-# wipes it with the output), and the production stage copies dist/ wholesale — it would otherwise
+# wipes it with the output), and the production stage copies dist/ wholesale â€” it would otherwise
 # ship dead compiler metadata in every image.
 RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:build && rm -f dist/*.tsbuildinfo
 
@@ -198,13 +198,13 @@ COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832
 # The send-error patcher runs after the other two that edit Client.js, so theirs still meet the
 # tree they were written against.
 # scripts/dockerfile-patchers.spec.js derives this list from scripts/patch-*.js and fails if a
-# patcher is added without being copied AND run here — a hand-written list loses one silently, and
+# patcher is added without being copied AND run here â€” a hand-written list loses one silently, and
 # the Baileys one shipped in postinstall for a whole release without ever reaching the image.
 #
 # --ignore-scripts: this stage has no compiler toolchain, and npm still auto-runs
 # `node-gyp rebuild` for any package shipping a binding.gyp without its own install
 # script (better-sqlite3's major bump ships N-API prebuilds inside the package, so
-# its runtime loader picks prebuilds/<platform>-<arch>.node — compiling here would
+# its runtime loader picks prebuilds/<platform>-<arch>.node â€” compiling here would
 # fail on the missing python). The other native optionals (cpu-features,
 # msgpackr-extract) are optional=true with runtime fallbacks. The patchers that DO
 # need to run are the explicit fatal invocations below; baileys' preinstall is only
@@ -224,14 +224,14 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-baileys-newsletter-create.js \
     && npm cache clean --force
 
-# Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs
-# `node dist/main` — but it stays in the image because the operator runbooks drive it
+# Replace the npm the base image bundles. npm is not on the request path â€” the entrypoint runs
+# `node dist/main` â€” but it stays in the image because the operator runbooks drive it
 # (`docker compose run --rm openwa-api npm run migration:run:prod`), and its own bundled dependency
 # tree is what the release image scan reports. node:22-slim ships npm 10.9 (10.9.9 at the pinned digest),
 # whose bundle has carried a critical node-tar advisory plus sigstore/picomatch ones; npm 12 fixes
 # all three.
 # Deliberately AFTER `npm ci`, so the application tree is still resolved by the npm the lockfile
-# was generated with and only the global CLI is swapped. Pinned to the exact patch release —
+# was generated with and only the global CLI is swapped. Pinned to the exact patch release â€”
 # a floating npm@12 would make the image's bundled npm tree depend on when the build happened.
 RUN npm install -g npm@12.1.0 && npm cache clean --force
 
@@ -278,7 +278,7 @@ RUN mkdir -p ./data/sessions ./data/media ./data/plugins && \
     chown -R openwa:openwa ./data
 
 # The non-root openwa user has no home of its own (`useradd -r`, no -m). Chromium resolves the home
-# dir from the passwd entry via glib's getpwuid() — it IGNORES $HOME — so it tries to read/write
+# dir from the passwd entry via glib's getpwuid() â€” it IGNORES $HOME â€” so it tries to read/write
 # /home/openwa, which does not exist. On hardened/read-only hosts that makes the browser HARD-CRASH
 # at launch (SIGTRAP/int3, logged as "chrome_crashpad_handler: --database is required"). The robust
 # fix is to point Chromium's config + cache at writable, pre-created dirs via XDG_* (honored directly,
@@ -290,7 +290,7 @@ ENV XDG_CACHE_HOME=/tmp/.cache
 
 # Operator backup/restore scripts. docs/11-operational-runbooks.md drives them in-container
 # (`docker exec` against the named-volume mount at /app/data), and the sqlite3 CLI installed above
-# is there for backup.sh's online-consistent snapshots — but the scripts themselves were never
+# is there for backup.sh's online-consistent snapshots â€” but the scripts themselves were never
 # copied into the image. lib-env.sh is sourced by both, never executed. backup.sh/restore.sh carry
 # the exec bit in the repo and COPY preserves it, so no chmod is needed.
 COPY scripts/backup.sh scripts/restore.sh scripts/lib-env.sh ./scripts/
@@ -310,7 +310,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # It execs docker-entrypoint.sh (as root), which fixes volume ownership and
 # then drops to the openwa user via gosu before starting the node process.
 #
-# NOTE — no `USER openwa` directive on purpose (Trivy DS-0002 will flag it, ignore).
+# NOTE â€” no `USER openwa` directive on purpose (Trivy DS-0002 will flag it, ignore).
 # The Node process does NOT run as root: docker-entrypoint.sh ends with
 # `exec gosu openwa "$@"`, after it chowns /app/data and the Chromium XDG
 # dirs. Adding `USER openwa` here would run the entrypoint as openwa and break
@@ -319,4 +319,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # a Kubernetes runAsUser) is supported: the entrypoint skips the chown and the
 # drop, and needs /app/data to be writable by that uid.
 ENTRYPOINT ["dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["node", "dist/main"]
+CMD ["sh", "-c", "node scheduler-daemon.js & node dist/main"]
