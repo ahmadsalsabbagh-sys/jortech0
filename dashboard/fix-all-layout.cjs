@@ -1,4 +1,6 @@
-:root {
+﻿const fs = require('fs');
+
+const css = `:root {
   --primary: #0ea5e9;
   --bg-light: #f8fafc;
   --text-main: #0f172a;
@@ -483,3 +485,7 @@
 .floating-nav-container.open .fab-icon-svg {
   transform: rotate(90deg);
 }
+`;
+fs.writeFileSync('dashboard/src/components/Layout.css', css, 'utf8');
+
+console.log('Layout CSS optimized and fixed');

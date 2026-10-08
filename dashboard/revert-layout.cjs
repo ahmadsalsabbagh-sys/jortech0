@@ -1,4 +1,6 @@
-import { useState } from 'react';
+﻿const fs = require('fs');
+
+const cleanLayout = `import { useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
@@ -47,7 +49,7 @@ export function Layout({ onLogout }: { onLogout: () => void; userRole: UserRole 
   const toggleLang = () => i18n.changeLanguage(isAr ? 'en' : 'ar');
 
   return (
-    <div className={`app-layout ${theme} ${isAr ? 'rtl' : 'ltr'}`} dir={isAr ? 'rtl' : 'ltr'}>
+    <div className={\`app-layout \${theme} \${isAr ? 'rtl' : 'ltr'}\`} dir={isAr ? 'rtl' : 'ltr'}>
       <header className="top-navbar">
         <div className="nav-brand">
           <img src="https://www.jortechjo.com/uploads/settings/69ff8042503c0.png" alt="JOR Tech" className="brand-logo-img" />
@@ -86,7 +88,7 @@ export function Layout({ onLogout }: { onLogout: () => void; userRole: UserRole 
         </div>
       </main>
 
-      <div className={`floating-nav-container ${isMenuOpen ? 'open' : ''}`}>
+      <div className={\`floating-nav-container \${isMenuOpen ? 'open' : ''}\`}>
         <div className="floating-overlay" onClick={() => setIsMenuOpen(false)}></div>
         
         <div className="floating-menu dark-glass">
@@ -99,9 +101,9 @@ export function Layout({ onLogout }: { onLogout: () => void; userRole: UserRole 
               <NavLink 
                 key={item.to} 
                 to={item.to} 
-                className={({ isActive }) => `menu-item ${isActive ? 'active' : ''}`}
+                className={({ isActive }) => \`menu-item \${isActive ? 'active' : ''}\`}
                 onClick={() => setIsMenuOpen(false)}
-                style={{ '--delay': `${index * 0.04}s` } as React.CSSProperties}
+                style={{ '--delay': \`\${index * 0.04}s\` } as React.CSSProperties}
               >
                 <div className="item-icon"><item.icon className="menu-svg-icon" /></div>
                 <span className="item-label">{item.label}</span>
@@ -116,4 +118,7 @@ export function Layout({ onLogout }: { onLogout: () => void; userRole: UserRole 
       </div>
     </div>
   );
-}
+}`;
+fs.writeFileSync('dashboard/src/components/Layout.tsx', cleanLayout, 'utf8');
+
+console.log('Layout.tsx reverted to clean state');
