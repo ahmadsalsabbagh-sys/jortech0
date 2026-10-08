@@ -13,7 +13,7 @@ import type { UserRole } from '../types/role';
 import './Layout.css';
 
 export function Layout({ onLogout }: { onLogout: () => void; userRole: UserRole | null }) {
-  const { t, i18n } = useTranslation();
+  const { i18n } = useTranslation();
   const { theme, toggleTheme } = useTheme();
   const { isAdmin, scoped } = useRole();
   const lang = resolveSupportedLanguage(i18n.language);
